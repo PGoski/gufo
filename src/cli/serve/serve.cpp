@@ -35,6 +35,7 @@
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/serve/serve_options.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -215,94 +216,6 @@ std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   return std::nullopt;
 }
 
-// Server-level options are accepted on either side of the modality
-// subcommand. Registering them from one place keeps `gufo serve --help`, every
-// `gufo serve <modality> --help`, and the parser that actually consumes them
-// from drifting apart.
-
-/// `--log-level` and its `-v/--verbose` shorthand share one sink. `level`
-/// holds the canonical spelling when given and stays empty otherwise; the two
-/// spellings together are a conflict, reported where the level is armed.
-struct ServerLogOptions {
-  bool verbose = false;
-  std::optional<server::LogLevel> level;
-};
-
-// Verbosity help text. `gufo serve --help` lists these options by hand while
-// every modality help registers them through the parser, so both readings share
-// one source for the wording.
-constexpr std::string_view kLogLevelHelp =
-    "Log verbosity: error, warn, info or debug (default: info)";
-constexpr std::string_view kVerboseHelp = "Shorthand for --log-level=debug";
-
-void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
-                      int* port, std::size_t* session_count,
-                      std::size_t* max_connections,
-                      std::size_t* max_request_body_bytes, std::string* api_key,
-                      ServerLogOptions* log) {
-  parser.AddOption("-i", "--host", "IP", "Bind address", "Server", host);
-  parser.AddOption("-p", "--port", "N", "Port to listen on", "Server", port);
-  if (session_count != nullptr)
-    parser.AddOption("-j", "--sessions", "N",
-                     "Preallocated GPU request sessions", "Server",
-                     session_count);
-  parser.AddOption("", "--max-connections", "N",
-                   "Maximum simultaneous HTTP connections", "Server",
-                   max_connections);
-  parser.AddOption("", "--max-request-bytes", "N",
-                   "Maximum HTTP request body bytes", "Server",
-                   max_request_body_bytes);
-  parser.AddOption("", "--api-key", "KEY", "API key", "Server", api_key);
-  parser.AddCustomOption(
-      "", "--log-level", "LEVEL", kLogLevelHelp, "Logging",
-      [log](std::string_view flag, std::string_view value, std::string* error) {
-        const auto level = server::LogLevelFromName(value);
-        if (!level.has_value()) {
-          *error = std::string(flag) + " must be error, warn, info or debug";
-          return false;
-        }
-        log->level = *level;
-        return true;
-      });
-  parser.AddFlag("-v", "--verbose", kVerboseHelp, "Logging", &log->verbose);
-}
-
-// Help-only sinks for AddServerOptions, so subcommand help can list the
-// server options it shares with `gufo serve` without parsing into them.
-struct ServerOptionHelpTargets {
-  std::string host = "127.0.0.1";
-  int port = 8080;
-  std::size_t session_count = 1;
-  std::size_t max_connections = 16;
-  std::size_t max_request_body_bytes =
-      static_cast<std::size_t>(8) * 1024 * 1024;
-  std::string api_key;
-  ServerLogOptions log;
-};
-
-void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
-                             ServerOptionHelpTargets* targets,
-                             bool include_sessions = true) {
-  AddServerOptions(parser, &targets->host, &targets->port,
-                   include_sessions ? &targets->session_count : nullptr,
-                   &targets->max_connections, &targets->max_request_body_bytes,
-                   &targets->api_key, &targets->log);
-}
-
-// Split a `NAME=VALUE` CLI spec. Returns false when either side is empty.
-bool SplitNameValue(std::string_view spec, std::string_view flag,
-                    std::string* name, std::string* value, std::string* error) {
-  const std::size_t separator = spec.find('=');
-  if (separator == std::string_view::npos || separator == 0 ||
-      separator + 1 >= spec.size()) {
-    *error = std::string(flag) + " expects NAME=VALUE";
-    return false;
-  }
-  *name = std::string(spec.substr(0, separator));
-  *value = std::string(spec.substr(separator + 1));
-  return true;
-}
-
 std::optional<std::string> ReadTextFile(const std::filesystem::path& path) {
   std::ifstream file(path);
   if (!file) {
@@ -438,120 +351,30 @@ std::optional<ReasoningOptions> ResolveReasoningDefaults(
   return options;
 }
 
-struct SpeechOptions {
-  std::filesystem::path model;
-  std::size_t context;
-  std::string served_model_name;
-  std::vector<std::pair<std::string, std::string>> voice_specs;
-  std::map<std::string, std::string> voice_text_specs;
-  std::map<std::string, std::string> voice_lang_specs;
-};
-
-void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
-  parser.AddOption("-m", "--model", "DIR",
-                   tts ? "Qwen3-TTS 12Hz 1.7B model directory"
-                       : "Qwen3-ASR 1.7B model directory",
-                   "Model", &options->model);
-  parser.AddOption("-c", "--context", "N",
-                   tts ? "Context capacity (default: 4096)"
-                       : "Context capacity per audio chunk (default: 1024)",
-                   "Model", &options->context);
-  parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
-                   "Model", &options->served_model_name);
-  if (!tts)
-    return;
-  parser.AddCustomOption(
-      "", "--voice", "NAME=PATH",
-      "Register a named Qwen3-TTS Base voice from a reference WAV "
-      "(repeatable)",
-      "Model",
-      [options](std::string_view, std::string_view value, std::string* err) {
-        std::string name;
-        std::string path;
-        if (!SplitNameValue(value, "--voice", &name, &path, err)) {
-          return false;
-        }
-        options->voice_specs.emplace_back(std::move(name), std::move(path));
-        return true;
-      });
-  parser.AddCustomOption(
-      "", "--voice-lang", "NAME=LANGUAGE",
-      "Language a --voice speaks; used when a request omits 'language' "
-      "(repeatable)",
-      "Model",
-      [options](std::string_view, std::string_view value, std::string* err) {
-        std::string name;
-        std::string language;
-        if (!SplitNameValue(value, "--voice-lang", &name, &language, err)) {
-          return false;
-        }
-        if (!options->voice_lang_specs
-                 .emplace(std::move(name), std::move(language))
-                 .second) {
-          *err = "duplicate --voice-lang name";
-          return false;
-        }
-        return true;
-      });
-  parser.AddCustomOption(
-      "", "--voice-text", "NAME=TEXT|PATH",
-      "Reference transcript for a --voice, given inline or as a file path; "
-      "defaults to a .txt sidecar beside the WAV (repeatable)",
-      "Model",
-      [options](std::string_view, std::string_view value, std::string* err) {
-        std::string name;
-        std::string text;
-        if (!SplitNameValue(value, "--voice-text", &name, &text, err)) {
-          return false;
-        }
-        if (!options->voice_text_specs.emplace(std::move(name), std::move(text))
-                 .second) {
-          *err = "duplicate --voice-text name";
-          return false;
-        }
-        return true;
-      });
-}
-
 }  // namespace
 
 void PrintServeHelp(std::string_view program_name,
                     std::string_view subcommand) {
   if (subcommand == "image") {
-    std::filesystem::path model;
-    std::string name = "Qwen-Image-2.1";
+    ImageServeOptions image;
     ArgParser parser(std::string(program_name) + " serve image",
                      "Serve Qwen-Image-2.1 generation and editing.");
-    parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 safetensors directory", "Model", &model);
-    parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
-                     "Model", &name);
+    RegisterImageServeOptions(parser, &image);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help, false);
     parser.PrintHelp();
     return;
   }
   if (subcommand == "video") {
-    std::filesystem::path video_model;
-    std::filesystem::path video_root = "video-jobs";
-    std::filesystem::path video_manifest = DefaultH3SourceManifest();
-    std::uint64_t video_ttl_seconds = 3600;
+    VideoServeOptions video;
+    video.root = "video-jobs";
+    video.manifest = DefaultH3SourceManifest();
+    video.ttl_seconds = 3600;
 
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve video",
         "Start the MiniMax H3 text-to-video HTTP generation server.");
-    parser.AddOption("-m", "--model", "DIR",
-                     "Operator-supplied MiniMax H3 directory", "Model",
-                     &video_model);
-    parser.AddOption(
-        "", "--root", "DIR",
-        "Storage root for persistent video jobs (default: video-jobs)",
-        "Storage", &video_root);
-    parser.AddOption("", "--manifest", "PATH", "Pinned H3 manifest override",
-                     "Storage", &video_manifest);
-    parser.AddOption("", "--ttl", "SEC",
-                     "Completed-artifact TTL in seconds (default: 3600)",
-                     "Storage", &video_ttl_seconds);
+    RegisterVideoServeOptions(parser, &video);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -560,12 +383,13 @@ void PrintServeHelp(std::string_view program_name,
 
   if (subcommand == "tts" || subcommand == "asr") {
     const bool tts = subcommand == "tts";
-    SpeechOptions options{.context = tts ? 4096U : 1024U};
+    SpeechServeOptions options;
+    options.context = tts ? 4096U : 1024U;
     ArgParser parser(
         std::string(program_name) + " serve " + std::string(subcommand),
         tts ? "Serve Qwen3-TTS speech synthesis."
             : "Serve Qwen3-ASR transcription.");
-    AddSpeechOptions(parser, tts, &options);
+    RegisterSpeechServeOptions(parser, tts, &options);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help, false);
     parser.PrintHelp();
@@ -573,147 +397,12 @@ void PrintServeHelp(std::string_view program_name,
   }
 
   if (subcommand == "llm") {
-    std::string model;
-    std::string served_model_name;
-    std::uint32_t max_context = 0;
-    std::int64_t max_tokens = -1;
-    sampling::SamplingConfig sampling_config;
-    std::string reasoning_mode = "auto";
-    std::string reasoning_effort = "auto";
-    std::string preserve_thinking = "auto";
-    std::string speculative_backend;
-    std::string dflash_model_path;
-    std::string draft_policy;
-    std::string dspark_model_path;
-    std::string mtp_model_path;
-    std::string vision_model_path;
-    std::size_t draft_tokens = 7;
-    std::size_t min_draft_tokens = 1;
-    std::size_t prefill_chunk_tokens =
-        server::kDefaultDecodeActivePrefillTokens;
-    std::size_t max_pending_requests = 16;
-    std::size_t max_pending_requests_per_client = 4;
-    std::uint64_t request_timeout_ms = 0;
-    std::size_t max_output_bytes = server::kDefaultMaxOutputBytes;
-    std::size_t max_buffered_output_bytes =
-        server::kDefaultMaxBufferedOutputBytes;
-    std::size_t max_buffered_output_bytes_total =
-        server::kDefaultMaxBufferedOutputBytesTotal;
-    std::size_t cache_ram_bytes = 0;
-    std::filesystem::path cache_disk_directory;
-    std::size_t cache_disk_bytes =
-        server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
-    std::size_t cache_disk_staging_bytes = 0;
-    bool log_progress = false;
+    LlmServeOptions llm;
 
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
-
-    // Model & Context
-    parser.AddOption("-m", "--model", "PATH",
-                     "Path to GGUF model file (required)", "Model", &model);
-    parser.AddOption("", "--mmproj", "PATH",
-                     "Qwen BF16 vision sidecar (auto-discovered beside model)",
-                     "Model", &vision_model_path);
-    parser.AddOption("", "--served-model-name", "ID",
-                     "Model identifier exposed by the OpenAI API", "Model",
-                     &served_model_name);
-    parser.AddOption(
-        "-c", "--context", "N",
-        "Context tokens per session (default: 0 = model native context)",
-        "Model", &max_context);
-
-    // Sampling Defaults
-    parser.AddOption(
-        "-n", "--max-tokens", "N",
-        "Default new-token limit (default: -1 = until EOS or context full)",
-        "Sampling Defaults", &max_tokens);
-    RegisterSamplingOptions(parser, &sampling_config, "Sampling Defaults", true,
-                            true);
-
-    // Reasoning Defaults
-    parser.AddOption(
-        "", "--think", "MODE",
-        "Default reasoning mode: on, off, or auto (default: model)",
-        "Reasoning Defaults", &reasoning_mode);
-    parser.AddOption(
-        "", "--reasoning-effort", "LEVEL",
-        "Default effort: auto, minimal, low, medium, high, xhigh, or max",
-        "Reasoning Defaults", &reasoning_effort);
-    parser.AddOption("", "--preserve-thinking", "MODE",
-                     "Replay prior reasoning: on, off, or auto",
-                     "Reasoning Defaults", &preserve_thinking);
-
-    // Speculative & Hardware
-    parser.AddOption("", "--speculative", "MODE",
-                     "HTTP draft backend: dspark, dflash2, mtp, or off",
-                     "Speculative", &speculative_backend);
-    parser.AddOption("", "--dflash-model", "PATH",
-                     "Path to Qwen DFlash2 GGUF file", "Speculative",
-                     &dflash_model_path);
-    parser.AddOption(
-        "", "--draft-policy", "POLICY",
-        "DFlash2 block length: fixed or adaptive (default: adaptive)",
-        "Speculative", &draft_policy);
-    parser.AddOption("", "--dspark-model", "PATH",
-                     "Path to DeepSeek V4 Flash DSpark support GGUF file",
-                     "Speculative", &dspark_model_path);
-    parser.AddOption("", "--mtp-model", "PATH",
-                     "Path to the Qwen MTP draft GGUF (Qwen3.8-Flash-Next: the "
-                     "mtp-...-shared-*.gguf sidecar)",
-                     "Speculative", &mtp_model_path);
-    parser.AddOption(
-        "-d", "--draft-tokens", "N",
-        "Maximum speculative draft tokens evaluated per step (default: 7)",
-        "Speculative", &draft_tokens);
-
-    parser.AddOption("", "--min-draft-tokens", "N",
-                     "Adaptive draft floor (default: 1)", "Speculative",
-                     &min_draft_tokens);
-    parser.AddOption(
-        "", "--prefill-chunk", "N",
-        "Maximum prompt tokens between active decode rounds (default: 512)",
-        "Scheduling", &prefill_chunk_tokens);
-    parser.AddOption("", "--max-pending", "N",
-                     "Maximum queued generation requests (default: 16)",
-                     "Scheduling", &max_pending_requests);
-    parser.AddOption("", "--max-pending-per-client", "N",
-                     "Maximum queued requests per client IP (default: 4)",
-                     "Scheduling", &max_pending_requests_per_client);
-    parser.AddOption(
-        "", "--request-timeout-ms", "MS",
-        "Queue plus generation timeout; 0 disables it (default: 0)",
-        "Scheduling", &request_timeout_ms);
-    parser.AddOption("", "--max-output-bytes", "N",
-                     "Maximum generated bytes per request (default: 1048576)",
-                     "Scheduling", &max_output_bytes);
-    parser.AddOption("", "--max-buffered-output-bytes", "N",
-                     "Maximum queued stream bytes per request (default: 65536)",
-                     "Scheduling", &max_buffered_output_bytes);
-    parser.AddOption(
-        "", "--max-buffered-output-total", "N",
-        "Maximum queued stream bytes across requests (default: 262144)",
-        "Scheduling", &max_buffered_output_bytes_total);
-    parser.AddOption(
-        "", "--cache-ram-bytes", "N",
-        "Retained RAM-cache byte budget (default: 0 = auto, at most 32 GiB)",
-        "Cache", &cache_ram_bytes);
-    parser.AddOption("", "--cache-disk", "DIR",
-                     "Opt-in restart-safe continuation cache directory",
-                     "Cache", &cache_disk_directory);
-    parser.AddOption("", "--cache-disk-bytes", "N",
-                     "Retained disk-cache byte budget (default: " +
-                         std::to_string(cache_disk_bytes) + ")",
-                     "Cache", &cache_disk_bytes);
-    parser.AddOption("", "--cache-disk-staging-bytes", "N",
-                     "RAM limit for queued snapshots and each disk read "
-                     "(default: 0 = auto, at most 1 GiB and 1/8 available RAM)",
-                     "Cache", &cache_disk_staging_bytes);
-    parser.AddFlag("", "--log-progress",
-                   "Log live prefill and decode progress (needs "
-                   "--log-level=info or debug)",
-                   "Logging", &log_progress);
+    RegisterLlmServeOptions(parser, &llm);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -922,14 +611,10 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::ImageService> images;
 
   if (subcommand == "image") {
-    std::filesystem::path model;
-    std::string name = "Qwen-Image-2.1";
+    ImageServeOptions image;
     ArgParser parser("gufo serve image",
                      "Serve Qwen-Image-2.1 generation and editing.");
-    parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 safetensors directory", "Model", &model);
-    parser.AddOption("", "--served-model-name", "NAME", "Public API model ID",
-                     "Model", &name);
+    RegisterImageServeOptions(parser, &image);
     add_server_options(parser, false);
     if (!parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << '\n';
@@ -941,38 +626,29 @@ int RunServe(std::span<const char* const> args) {
     }
     if (!prepare_server_options())
       return 2;
-    if (model.empty()) {
+    if (image.model.empty()) {
       std::cerr << "Error: --model <DIR> is required for image server\n";
       return 2;
     }
-    ModelLoadLog load_log("qwen_image_21", model);
+    ModelLoadLog load_log("qwen_image_21", image.model);
     try {
-      images = std::make_shared<server::ImageService>(model, name);
+      images = std::make_shared<server::ImageService>(image.model,
+                                                      image.served_model_name);
     } catch (const std::exception& error) {
       std::cerr << "Error loading Qwen-Image-2.1: " << error.what() << '\n';
       return 1;
     }
-    load_log.Complete("model=" + name + " weights=mapped upload=on_demand");
+    load_log.Complete("model=" + image.served_model_name +
+                      " weights=mapped upload=on_demand");
   } else if (subcommand == "video") {
-    std::filesystem::path video_model;
-    std::filesystem::path video_root = "video-jobs";
-    std::filesystem::path video_manifest = DefaultH3SourceManifest();
-    std::uint64_t video_ttl_seconds = 3600;
+    VideoServeOptions video;
+    video.root = "video-jobs";
+    video.manifest = DefaultH3SourceManifest();
+    video.ttl_seconds = 3600;
 
     gufo::cli::ArgParser video_parser(
         "gufo serve video", "Start the MiniMax H3 video generation server.");
-    video_parser.AddOption("-m", "--model", "DIR",
-                           "Operator-supplied MiniMax H3 directory", "Model",
-                           &video_model);
-    video_parser.AddOption("", "--root", "DIR",
-                           "Storage root for persistent video jobs", "Storage",
-                           &video_root);
-    video_parser.AddOption("", "--manifest", "PATH",
-                           "Pinned H3 manifest override", "Storage",
-                           &video_manifest);
-    video_parser.AddOption("", "--ttl", "SEC",
-                           "Completed-artifact TTL in seconds", "Storage",
-                           &video_ttl_seconds);
+    RegisterVideoServeOptions(video_parser, &video);
 
     add_server_options(video_parser);
     if (!video_parser.Parse(sub_args, &parse_err)) {
@@ -988,28 +664,28 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
 
-    if (video_ttl_seconds == 0 ||
-        video_ttl_seconds >
+    if (video.ttl_seconds == 0 ||
+        video.ttl_seconds >
             static_cast<std::uint64_t>(std::chrono::seconds::max().count())) {
       std::cerr << "Error: --ttl must be a positive duration\n";
       return 2;
     }
 
-    if (video_model.empty()) {
+    if (video.model.empty()) {
       std::cerr << "Error: --model <DIR> is required for video server\n";
       PrintServeHelp("gufo", "video");
       return 2;
     }
 
-    ModelLoadLog load_log("video_inventory", video_model);
+    ModelLoadLog load_log("video_inventory", video.model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
-            .model_root = video_model,
-            .source_manifest = video_manifest,
-            .storage_root = video_root,
+            .model_root = video.model,
+            .source_manifest = video.manifest,
+            .storage_root = video.root,
             .queue_capacity = 1,
             .artifact_ttl = std::chrono::seconds(
-                static_cast<std::chrono::seconds::rep>(video_ttl_seconds)),
+                static_cast<std::chrono::seconds::rep>(video.ttl_seconds)),
             .validate_model_inventory = true,
             .id_factory = {},
             .now = {},
@@ -1024,11 +700,12 @@ int RunServe(std::span<const char* const> args) {
         "model=minimax-h3 sessions=1 queue_capacity=1 weights=lazy", false);
   } else if (subcommand == "tts" || subcommand == "asr") {
     const bool is_tts = subcommand == "tts";
-    SpeechOptions options{.context = is_tts ? 4096U : 1024U};
+    SpeechServeOptions options;
+    options.context = is_tts ? 4096U : 1024U;
     ArgParser parser("gufo serve " + subcommand,
                      is_tts ? "Serve Qwen3-TTS speech synthesis."
                             : "Serve Qwen3-ASR transcription.");
-    AddSpeechOptions(parser, is_tts, &options);
+    RegisterSpeechServeOptions(parser, is_tts, &options);
     add_server_options(parser, false);
     if (!parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << '\n';
@@ -1105,145 +782,12 @@ int RunServe(std::span<const char* const> args) {
     }
   } else {
     // Default to LLM server
-    std::string model;
-    std::string served_model_name;
-    std::uint32_t max_context = 0;
-    std::int64_t max_tokens = -1;
-    sampling::SamplingConfig sampling_config;
-    std::string reasoning_mode = "auto";
-    std::string reasoning_effort = "auto";
-    std::string preserve_thinking = "auto";
-    std::string speculative_backend;
-    std::string dflash_model_path;
-    std::string draft_policy;
-    std::string dspark_model_path;
-    std::string mtp_model_path;
-    std::string vision_model_path;
-    std::size_t draft_tokens = 7;
-    std::size_t min_draft_tokens = 1;
-    std::size_t prefill_chunk_tokens =
-        server::kDefaultDecodeActivePrefillTokens;
-    std::size_t max_pending_requests = 16;
-    std::size_t max_pending_requests_per_client = 4;
-    std::uint64_t request_timeout_ms = 0;
-    std::size_t max_output_bytes = server::kDefaultMaxOutputBytes;
-    std::size_t max_buffered_output_bytes =
-        server::kDefaultMaxBufferedOutputBytes;
-    std::size_t max_buffered_output_bytes_total =
-        server::kDefaultMaxBufferedOutputBytesTotal;
-    std::size_t cache_ram_bytes = 0;
-    std::filesystem::path cache_disk_directory;
-    std::size_t cache_disk_bytes =
-        server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
-    std::size_t cache_disk_staging_bytes = 0;
-    bool log_progress = false;
+    LlmServeOptions llm;
 
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
-    llm_parser.AddOption("-m", "--model", "PATH",
-                         "Path to GGUF model file (required)", "Model", &model);
-    llm_parser.AddOption(
-        "", "--mmproj", "PATH",
-        "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
-        &vision_model_path);
-    llm_parser.AddOption("", "--served-model-name", "ID",
-                         "Model identifier exposed by the OpenAI API", "Model",
-                         &served_model_name);
-    llm_parser.AddOption(
-        "-c", "--context", "N",
-        "Context tokens per session (default: 0 = model native context)",
-        "Model", &max_context);
-    llm_parser.AddOption(
-        "-n", "--max-tokens", "N",
-        "Default new-token limit (default: -1 = until EOS or context full)",
-        "Sampling Defaults", &max_tokens);
-    RegisterSamplingOptions(llm_parser, &sampling_config, "Sampling Defaults",
-                            true, true);
-    llm_parser.AddOption(
-        "", "--think", "MODE",
-        "Default reasoning mode: on, off, or auto (default: model)",
-        "Reasoning Defaults", &reasoning_mode);
-    llm_parser.AddOption(
-        "", "--reasoning-effort", "LEVEL",
-        "Default effort: auto, minimal, low, medium, high, xhigh, or max",
-        "Reasoning Defaults", &reasoning_effort);
-    llm_parser.AddOption("", "--preserve-thinking", "MODE",
-                         "Replay prior reasoning: on, off, or auto",
-                         "Reasoning Defaults", &preserve_thinking);
-    llm_parser.AddOption("", "--speculative", "MODE",
-                         "HTTP draft backend: dspark, dflash2, mtp, or off",
-                         "Speculative", &speculative_backend);
-    llm_parser.AddOption("", "--dflash-model", "PATH",
-                         "Path to Qwen DFlash2 GGUF file", "Speculative",
-                         &dflash_model_path);
-    llm_parser.AddOption(
-        "", "--draft-policy", "POLICY",
-        "DFlash2 block length: fixed or adaptive (default: adaptive)",
-        "Speculative", &draft_policy);
-    llm_parser.AddOption("", "--dspark-model", "PATH",
-                         "Path to DeepSeek V4 Flash DSpark support GGUF file",
-                         "Speculative", &dspark_model_path);
-    llm_parser.AddOption(
-        "", "--mtp-model", "PATH",
-        "Path to the Qwen MTP draft GGUF (Qwen3.8-Flash-Next: the "
-        "mtp-...-shared-*.gguf sidecar)",
-        "Speculative", &mtp_model_path);
-    llm_parser.AddOption(
-        "-d", "--draft-tokens", "N",
-        "Maximum speculative draft tokens evaluated per step (default: 7)",
-        "Speculative", &draft_tokens);
-
-    llm_parser.AddOption("", "--min-draft-tokens", "N",
-                         "Adaptive draft floor (default: 1)", "Speculative",
-                         &min_draft_tokens);
-    llm_parser.AddOption(
-        "", "--prefill-chunk", "N",
-        "Maximum prompt tokens between active decode rounds (default: 512)",
-        "Scheduling", &prefill_chunk_tokens);
-    llm_parser.AddOption("", "--max-pending", "N",
-                         "Maximum queued generation requests (default: 16)",
-                         "Scheduling", &max_pending_requests);
-    llm_parser.AddOption("", "--max-pending-per-client", "N",
-                         "Maximum queued requests per client IP (default: 4)",
-                         "Scheduling", &max_pending_requests_per_client);
-    llm_parser.AddOption(
-        "", "--request-timeout-ms", "MS",
-        "Queue plus generation timeout; 0 disables it (default: 0)",
-        "Scheduling", &request_timeout_ms);
-    llm_parser.AddOption(
-        "", "--max-output-bytes", "N",
-        "Maximum generated bytes per request (default: 1048576)", "Scheduling",
-        &max_output_bytes);
-    llm_parser.AddOption(
-        "", "--max-buffered-output-bytes", "N",
-        "Maximum queued stream bytes per request (default: 65536)",
-        "Scheduling", &max_buffered_output_bytes);
-    llm_parser.AddOption(
-        "", "--max-buffered-output-total", "N",
-        "Maximum queued stream bytes across requests (default: 262144)",
-        "Scheduling", &max_buffered_output_bytes_total);
-    llm_parser.AddOption(
-        "", "--cache-ram-bytes", "N",
-        "Retained RAM-cache byte budget (default: 0 = auto, at most 32 GiB)",
-        "Cache", &cache_ram_bytes);
-    llm_parser.AddOption("", "--cache-disk", "DIR",
-                         "Opt-in restart-safe continuation cache directory",
-                         "Cache", &cache_disk_directory);
-    llm_parser.AddOption("", "--cache-disk-bytes", "N",
-                         "Retained disk-cache byte budget (default: " +
-                             std::to_string(cache_disk_bytes) + ")",
-                         "Cache", &cache_disk_bytes);
-    llm_parser.AddOption(
-        "", "--cache-disk-staging-bytes", "N",
-        "RAM limit for queued snapshots and each disk read "
-        "(default: 0 = auto, at most 1 GiB and 1/8 available RAM)",
-        "Cache", &cache_disk_staging_bytes);
-    llm_parser.AddFlag("", "--log-progress",
-                       "Log live prefill and decode progress (needs "
-                       "--log-level=info or debug)",
-                       "Logging", &log_progress);
-
+    RegisterLlmServeOptions(llm_parser, &llm);
     add_server_options(llm_parser);
     if (!llm_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
@@ -1260,127 +804,130 @@ int RunServe(std::span<const char* const> args) {
     // Progress lines are INFO-tier. Under a quieter threshold `--log-progress`
     // would be accepted and then silently discarded, so reject the combination
     // instead of ignoring an option the caller asked for.
-    if (log_progress && !server::Logger::Enabled(server::LogLevel::kInfo)) {
+    if (llm.log_progress && !server::Logger::Enabled(server::LogLevel::kInfo)) {
       std::cerr << "Error: --log-progress needs --log-level=info or "
                    "--log-level=debug\n";
       return 2;
     }
     sampling::SamplingConfig validated_sampling;
     const bool sampling_valid = !server::ParseSamplingConfig(
-        json::Value::object(), sampling_config, &validated_sampling);
-    if (max_tokens < -1 || max_tokens == 0 ||
-        max_tokens > std::numeric_limits<std::uint32_t>::max() ||
-        prefill_chunk_tokens == 0 || max_pending_requests == 0 ||
-        max_pending_requests_per_client == 0 ||
-        max_pending_requests_per_client > max_pending_requests ||
-        max_output_bytes == 0 || max_buffered_output_bytes == 0 ||
-        max_buffered_output_bytes_total == 0 ||
-        (!cache_disk_directory.empty() && cache_disk_bytes == 0) ||
-        request_timeout_ms > static_cast<std::uint64_t>(
-                                 std::chrono::milliseconds::max().count()) ||
+        json::Value::object(), llm.sampling_config, &validated_sampling);
+    if (llm.max_tokens < -1 || llm.max_tokens == 0 ||
+        llm.max_tokens > std::numeric_limits<std::uint32_t>::max() ||
+        llm.prefill_chunk_tokens == 0 || llm.max_pending_requests == 0 ||
+        llm.max_pending_requests_per_client == 0 ||
+        llm.max_pending_requests_per_client > llm.max_pending_requests ||
+        llm.max_output_bytes == 0 || llm.max_buffered_output_bytes == 0 ||
+        llm.max_buffered_output_bytes_total == 0 ||
+        (!llm.cache_disk_directory.empty() && llm.cache_disk_bytes == 0) ||
+        llm.request_timeout_ms >
+            static_cast<std::uint64_t>(
+                std::chrono::milliseconds::max().count()) ||
         !sampling_valid) {
       std::cerr << "Error: sampling and scheduling limits are invalid\n";
       return 2;
     }
-    if (draft_tokens == 0 || min_draft_tokens == 0 ||
-        min_draft_tokens > draft_tokens ||
-        draft_tokens > std::numeric_limits<std::uint32_t>::max()) {
+    if (llm.draft_tokens == 0 || llm.min_draft_tokens == 0 ||
+        llm.min_draft_tokens > llm.draft_tokens ||
+        llm.draft_tokens > std::numeric_limits<std::uint32_t>::max()) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
     }
-    const auto reasoning_defaults = ResolveReasoningDefaults(
-        reasoning_mode, reasoning_effort, preserve_thinking, &parse_err);
+    const auto reasoning_defaults =
+        ResolveReasoningDefaults(llm.reasoning_mode, llm.reasoning_effort,
+                                 llm.preserve_thinking, &parse_err);
     if (!reasoning_defaults.has_value()) {
       std::cerr << "Error: " << parse_err << "\n";
       return 2;
     }
 
     server::TextSpeculativeConfig speculative_config;
-    if (speculative_backend.empty() && !dspark_model_path.empty()) {
-      speculative_backend = "dspark";
+    if (llm.speculative_backend.empty() && !llm.dspark_model_path.empty()) {
+      llm.speculative_backend = "dspark";
     }
-    if (speculative_backend.empty() || speculative_backend == "off") {
+    if (llm.speculative_backend.empty() || llm.speculative_backend == "off") {
       speculative_config.backend = server::TextSpeculativeBackend::kDisabled;
-    } else if (speculative_backend == "dflash2") {
+    } else if (llm.speculative_backend == "dflash2") {
       speculative_config.backend = server::TextSpeculativeBackend::kDFlash;
-    } else if (speculative_backend == "dspark") {
+    } else if (llm.speculative_backend == "dspark") {
       speculative_config.backend = server::TextSpeculativeBackend::kDSpark;
-    } else if (speculative_backend == "mtp") {
+    } else if (llm.speculative_backend == "mtp") {
       speculative_config.backend = server::TextSpeculativeBackend::kMtp;
     } else {
-      std::cerr << "Error: speculative backend '" << speculative_backend
+      std::cerr << "Error: speculative backend '" << llm.speculative_backend
                 << "' is not supported by the HTTP server\n";
       return 2;
     }
     try {
-      if (!draft_policy.empty() &&
+      if (!llm.draft_policy.empty() &&
           speculative_config.backend != server::TextSpeculativeBackend::kDFlash)
         throw std::invalid_argument("--draft-policy requires DFlash2");
       speculative_config.dflash_policy =
-          speculative::ParseDFlashDraftPolicy(draft_policy);
+          speculative::ParseDFlashDraftPolicy(llm.draft_policy);
     } catch (const std::invalid_argument& exception) {
       std::cerr << "Error: " << exception.what() << '\n';
       return 2;
     }
     if (speculative_config.backend == server::TextSpeculativeBackend::kDFlash &&
-        (dflash_model_path.empty() || min_draft_tokens != 1)) {
+        (llm.dflash_model_path.empty() || llm.min_draft_tokens != 1)) {
       std::cerr << "Error: DFlash2 requires --dflash-model and "
                    "--min-draft-tokens 1; bound blocks with --draft-tokens\n";
       return 2;
     }
     speculative_config.draft_model_path =
         speculative_config.backend == server::TextSpeculativeBackend::kDSpark
-            ? dspark_model_path
+            ? llm.dspark_model_path
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
-            ? mtp_model_path
-            : dflash_model_path;
+            ? llm.mtp_model_path
+            : llm.dflash_model_path;
     speculative_config.max_draft_tokens =
-        static_cast<std::uint32_t>(draft_tokens);
+        static_cast<std::uint32_t>(llm.draft_tokens);
     speculative_config.min_draft_tokens =
-        static_cast<std::uint32_t>(min_draft_tokens);
-    if (model.empty()) {
+        static_cast<std::uint32_t>(llm.min_draft_tokens);
+    if (llm.model.empty()) {
       std::cerr << "Error: --model <PATH> is required\n";
       return 2;
     }
     std::string err;
-    ModelLoadLog load_log("text", model);
+    ModelLoadLog load_log("text", llm.model);
     backend = std::make_shared<server::InferenceBackend>();
-    if (!backend->load(model, &err, max_context, session_count,
-                       server::TextPrefillPolicy{
-                           .decode_active_tokens = prefill_chunk_tokens,
-                       },
-                       server::TextSchedulerPolicy{
-                           .max_pending_requests = max_pending_requests,
-                           .max_pending_requests_per_client =
-                               max_pending_requests_per_client,
-                           .max_output_bytes_per_request = max_output_bytes,
-                           .max_buffered_output_bytes_per_request =
-                               max_buffered_output_bytes,
-                           .max_buffered_output_bytes_total =
-                               max_buffered_output_bytes_total,
-                           .request_timeout =
-                               std::chrono::milliseconds{
-                                   static_cast<std::chrono::milliseconds::rep>(
-                                       request_timeout_ms)},
-                           .log_progress = log_progress,
-                       },
-                       speculative_config,
-                       server::TextDiskCacheConfig{
-                           .directory = cache_disk_directory,
-                           .capacity_bytes = cache_disk_bytes,
-                           .staging_capacity_bytes = cache_disk_staging_bytes,
-                           .model_artifact_fingerprint = {},
-                       },
-                       vision_model_path,
-                       server::TextRunnerRamCacheOptions{
-                           .capacity_bytes = cache_ram_bytes})) {
-      std::cerr << "Error loading model '" << model << "': " << err << "\n";
+    if (!backend->load(
+            llm.model, &err, llm.max_context, session_count,
+            server::TextPrefillPolicy{
+                .decode_active_tokens = llm.prefill_chunk_tokens,
+            },
+            server::TextSchedulerPolicy{
+                .max_pending_requests = llm.max_pending_requests,
+                .max_pending_requests_per_client =
+                    llm.max_pending_requests_per_client,
+                .max_output_bytes_per_request = llm.max_output_bytes,
+                .max_buffered_output_bytes_per_request =
+                    llm.max_buffered_output_bytes,
+                .max_buffered_output_bytes_total =
+                    llm.max_buffered_output_bytes_total,
+                .request_timeout =
+                    std::chrono::milliseconds{
+                        static_cast<std::chrono::milliseconds::rep>(
+                            llm.request_timeout_ms)},
+                .log_progress = llm.log_progress,
+            },
+            speculative_config,
+            server::TextDiskCacheConfig{
+                .directory = llm.cache_disk_directory,
+                .capacity_bytes = llm.cache_disk_bytes,
+                .staging_capacity_bytes = llm.cache_disk_staging_bytes,
+                .model_artifact_fingerprint = {},
+            },
+            llm.vision_model_path,
+            server::TextRunnerRamCacheOptions{.capacity_bytes =
+                                                  llm.cache_ram_bytes})) {
+      std::cerr << "Error loading model '" << llm.model << "': " << err << "\n";
       return 1;
     }
-    backend->set_model_id(served_model_name);
+    backend->set_model_id(llm.served_model_name);
     backend->set_sampling_defaults(
-        max_tokens < 0 ? 0 : static_cast<std::size_t>(max_tokens),
-        sampling_config, SamplingOptionsSupplied(llm_parser));
+        llm.max_tokens < 0 ? 0 : static_cast<std::size_t>(llm.max_tokens),
+        llm.sampling_config, SamplingOptionsSupplied(llm_parser));
     backend->set_reasoning_defaults(*reasoning_defaults);
     const auto effective_sampling =
         backend->sampling_defaults().Resolve(reasoning_defaults->enabled);
@@ -1421,7 +968,8 @@ int RunServe(std::span<const char* const> args) {
         " sessions=" + std::to_string(session_count) + " context_tokens=" +
         std::to_string(backend->max_context()) + " speculative=" + speculation +
         " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
-        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
+        " disk_cache=" +
+        (llm.cache_disk_directory.empty() ? "off" : "enabled"));
   }
 
   // run() joins every request thread, so no hook call outlives it.

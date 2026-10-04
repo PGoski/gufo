@@ -200,6 +200,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 add_library(gufo_http STATIC
+  src/cli/serve/serve_options.cpp
   src/cli/serve/image_api.cpp
   src/cli/serve/audio_asr_api.cpp
   src/cli/serve/asr_service.cpp
@@ -359,6 +360,11 @@ if (BUILD_TESTING)
   target_link_libraries(arg_parser_test PRIVATE gufo_core)
   add_test(NAME arg_parser_test COMMAND arg_parser_test)
   set_tests_properties(arg_parser_test PROPERTIES LABELS "cpu;cli")
+
+  add_executable(serve_options_test tests/cli/serve_options_test.cpp)
+  target_link_libraries(serve_options_test PRIVATE gufo_http)
+  add_test(NAME serve_options_test COMMAND serve_options_test)
+  set_tests_properties(serve_options_test PROPERTIES LABELS "cpu;server;cli")
 
   add_executable(json_constraint_test tests/core/json_constraint_test.cpp)
   target_link_libraries(json_constraint_test PRIVATE gufo_core)
