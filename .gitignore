@@ -118,3 +118,7 @@ tests/quality/compsec.json
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Local worktrees and SDD scratch
+.worktrees/
+.superpowers/
