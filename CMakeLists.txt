@@ -203,6 +203,7 @@ add_library(gufo_http STATIC
   src/cli/serve/router/preset.cpp
   src/cli/serve/router/proxy.cpp
   src/cli/serve/router/registry.cpp
+  src/cli/serve/router/router.cpp
   src/cli/serve/router/workers.cpp
   src/cli/serve/router/ws_relay.cpp
   src/cli/serve/serve_options.cpp
@@ -325,6 +326,11 @@ if (BUILD_TESTING)
 
   add_test(NAME gufo_help COMMAND gufo --help)
   set_tests_properties(gufo_help PROPERTIES LABELS "cpu")
+
+  add_test(NAME gufo_router_help COMMAND gufo router --help)
+  set_tests_properties(gufo_router_help PROPERTIES
+    LABELS "cpu;server;cli"
+    PASS_REGULAR_EXPRESSION "\\[llm/<model-id>\\]")
 
   add_test(NAME gufo_probe COMMAND gufo probe)
   set_tests_properties(gufo_probe PROPERTIES LABELS "cpu")

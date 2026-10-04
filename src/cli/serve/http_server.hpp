@@ -93,6 +93,10 @@ struct HttpServerOptions {
   /// a lost device. Health, readiness and generation answer 503 `device_lost`
   /// from then on; the hook decides how the process exits.
   std::function<void()> on_device_lost{};
+  /// When set, handle_request returns dispatcher(request) immediately after
+  /// authentication; built-in health/model routes are skipped and the
+  /// constructor does not register model routes (null backend is then legal).
+  std::function<HttpResponse(const HttpRequest&)> dispatcher{};
 };
 
 /// Minimal bounded HTTP/1.1 server for trusted-LAN model serving.

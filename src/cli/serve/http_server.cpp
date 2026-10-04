@@ -1302,7 +1302,9 @@ HttpServer::HttpServer(std::string host, int port,
   if (!options_.api_key.empty()) {
     api_key_hash_ = CredentialHash(options_.api_key);
   }
-  register_routes();
+  if (!options_.dispatcher) {
+    register_routes();
+  }
 }
 
 HttpServer::~HttpServer() {
@@ -1534,6 +1536,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                         "authentication_error", "invalid_api_key");
     response.headers.emplace_back("WWW-Authenticate", "Bearer");
     return response;
+  }
+  if (options_.dispatcher) {
+    return options_.dispatcher(req);
   }
   // `/health` and `/ready` are the native spelling and match llama-server's
   // `/health`. `/healthz` and `/readyz` are aliases so Kubernetes-style probe

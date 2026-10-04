@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 
 
 def main():
@@ -159,6 +160,18 @@ def main():
         check([command, "--draft-tokens", "0"], 2, "draft-tokens")
     check(["chat", "unexpected"], 2, "Unexpected argument")
     check(["chat", "--prompt", "unused"], 2, "Unknown option")
+    check(["router"], 2, "--models-preset")
+    check(["router", "--models-preset", "/nonexistent.preset"], 2, "nonexistent")
+    check(["router", "--help"], 0, "[llm/<model-id>]")
+    check(["help", "router"], 0, "models-max")
+    check(["--help"], 0, "router")
+    with tempfile.NamedTemporaryFile("w", suffix=".preset", delete=False) as bad:
+        bad.write("[llm/a]\n")
+        bad_file = bad.name
+    try:
+        check(["router", "--models-preset", bad_file], 2, "[llm/a]")
+    finally:
+        os.unlink(bad_file)
     print("Serving and text CLI checks passed.")
 
 

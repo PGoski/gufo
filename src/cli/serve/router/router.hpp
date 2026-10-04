@@ -1,0 +1,15 @@
+#ifndef GUFO_CLI_SERVE_ROUTER_ROUTER_HPP_
+#define GUFO_CLI_SERVE_ROUTER_ROUTER_HPP_
+
+#include <span>
+
+namespace gufo::cli {
+
+/// `gufo router`: validate a preset file, optionally preload workers, and
+/// serve health, readiness and model listing on one listener. Request
+/// relaying and admission arrive with the follow-up tasks.
+int RunRouter(std::span<const char* const> args);
+
+}  // namespace gufo::cli
+
+#endif  // GUFO_CLI_SERVE_ROUTER_ROUTER_HPP_

@@ -1488,6 +1488,75 @@ void TestRawCompletionPromptProgress() {
                400);
 }
 
+std::string RawRequest(int port, const std::string& request) {
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  assert(fd >= 0);
+  const timeval timeout{3, 0};
+  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ==
+         0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<unsigned short>(port));
+  assert(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+  assert(::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                   sizeof(address)) == 0);
+  std::string_view remaining = request;
+  while (!remaining.empty()) {
+    const auto count =
+        ::send(fd, remaining.data(), remaining.size(), MSG_NOSIGNAL);
+    assert(count > 0);
+    remaining.remove_prefix(static_cast<std::size_t>(count));
+  }
+  std::string response;
+  char buffer[4096];
+  for (;;) {
+    const auto count = ::read(fd, buffer, sizeof(buffer));
+    assert(count >= 0);
+    if (count == 0)
+      break;
+    response.append(buffer, static_cast<std::size_t>(count));
+  }
+  ::close(fd);
+  return response;
+}
+
+void TestDispatcherHook() {
+  gufo::server::HttpServerOptions options;
+  options.dispatcher = [](const gufo::server::HttpRequest& request) {
+    return gufo::server::HttpResponse{.body = "dispatched" + request.path};
+  };
+  HttpServer server("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+                    options);
+  std::string error;
+  assert(server.start(&error));
+  std::jthread worker([&server] { server.run(); });
+  const auto routed =
+      RawRequest(server.port(), "GET /anything HTTP/1.1\r\n\r\n");
+  ExpectStatus(routed, 200);
+  assert(routed.find("dispatched/anything") != std::string::npos);
+  const auto health = RawRequest(server.port(), "GET /health HTTP/1.1\r\n\r\n");
+  ExpectStatus(health, 200);
+  assert(health.find("dispatched/health") != std::string::npos);
+  server.stop();
+  worker.join();
+
+  gufo::server::HttpServerOptions secured;
+  secured.api_key = "test-secret";
+  secured.dispatcher = [](const gufo::server::HttpRequest& request) {
+    return gufo::server::HttpResponse{.body = "dispatched" + request.path};
+  };
+  HttpServer guarded("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+                     secured);
+  assert(guarded.start(&error));
+  std::jthread guard_worker([&guarded] { guarded.run(); });
+  const auto denied =
+      RawRequest(guarded.port(), "GET /anything HTTP/1.1\r\n\r\n");
+  ExpectStatus(denied, 401);
+  assert(denied.find("dispatched") == std::string::npos);
+  guarded.stop();
+  guard_worker.join();
+}
+
 int main() {
   // The log assertions below match "[LEVEL] [component]" text written to a
   // redirected stderr sink, so the real stderr's TTY state must not add ANSI
@@ -1500,6 +1569,7 @@ int main() {
   TestInvalidBindSettings();
   TestQueryParameters();
   TestAuthorization();
+  TestDispatcherHook();
   TestFramingAndMetrics();
   TestFallbackBackendMetrics();
   TestCompatibilityRequests();

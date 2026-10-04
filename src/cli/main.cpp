@@ -8,6 +8,7 @@
 #include "src/cli/diagnose/diagnose.h"
 #include "src/cli/eval/eval.hpp"
 #include "src/cli/prompt/prompt.hpp"
+#include "src/cli/serve/router/router.hpp"
 #include "src/cli/serve/serve.hpp"
 #include "src/cli/transcribe/transcribe.hpp"
 #include "src/cli/video/video.hpp"
@@ -36,6 +37,8 @@ void print_help(std::string_view program_name) {
          "(gfx1151).\n\n"
       << "Commands:\n"
       << "  serve          Start the OpenAI-compatible HTTP server\n"
+      << "  router         Serve multiple preset models with on-demand "
+         "loading\n"
       << "  prompt         Execute one prompt request and exit\n"
       << "  chat           Start an interactive terminal conversation\n"
       << "  bench          Benchmark prompt processing and token generation\n"
@@ -91,6 +94,9 @@ int run(std::span<const char* const> args) {
         return gufo::cli::RunServe(serve_help_flags);
       }
       return gufo::cli::RunServe(help_flag);
+    }
+    if (sub == "router") {
+      return gufo::cli::RunRouter(help_flag);
     }
     if (sub == "prompt") {
       return gufo::cli::RunPrompt(help_flag);
@@ -153,6 +159,10 @@ int run(std::span<const char* const> args) {
 
   if (first_arg == "chat") {
     return gufo::cli::RunChat(options.subspan(1));
+  }
+
+  if (first_arg == "router") {
+    return gufo::cli::RunRouter(options.subspan(1));
   }
 
   if (first_arg == "serve") {
