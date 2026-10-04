@@ -200,6 +200,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 add_library(gufo_http STATIC
+  src/cli/serve/router/preset.cpp
   src/cli/serve/serve_options.cpp
   src/cli/serve/image_api.cpp
   src/cli/serve/audio_asr_api.cpp
@@ -365,6 +366,12 @@ if (BUILD_TESTING)
   target_link_libraries(serve_options_test PRIVATE gufo_http)
   add_test(NAME serve_options_test COMMAND serve_options_test)
   set_tests_properties(serve_options_test PROPERTIES LABELS "cpu;server;cli")
+
+  add_executable(router_preset_test tests/cli/router_preset_test.cpp)
+  target_link_libraries(router_preset_test PRIVATE gufo_http)
+  add_test(NAME router_preset_test COMMAND router_preset_test)
+  set_tests_properties(router_preset_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
 
   add_executable(json_constraint_test tests/core/json_constraint_test.cpp)
   target_link_libraries(json_constraint_test PRIVATE gufo_core)
