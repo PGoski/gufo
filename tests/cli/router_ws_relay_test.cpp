@@ -142,6 +142,14 @@ bool ReadRawFrame(int fd, std::string* frame, Milliseconds budget) {
   return true;
 }
 
+/// One unmasked server frame, exactly as a worker sends to a client.
+std::string ServerFrame(std::uint8_t opcode, std::string_view payload) {
+  std::string frame(1, static_cast<char>(0x80U | opcode));
+  frame.push_back(static_cast<char>(payload.size()));
+  frame.append(payload);
+  return frame;
+}
+
 /// One masked client frame, exactly as a browser (and therefore `HttpServer`)
 /// delivers it.
 std::string MaskedFrame(std::uint8_t opcode, std::string_view payload) {
@@ -190,7 +198,7 @@ std::string HeadValue(std::string_view head, std::string_view name) {
 /// every received frame verbatim, then closes on request.
 class FakeWsWorker {
 public:
-  enum class Mode { kEchoThenClose, kWrongAccept };
+  enum class Mode { kEchoThenClose, kWrongAccept, kPipelinedHeadFrame };
 
   explicit FakeWsWorker(Mode mode) : mode_(mode) {
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -253,12 +261,18 @@ private:
     seen_key_ = HeadValue(head, "Sec-WebSocket-Key");
     const std::string accept =
         mode_ == Mode::kWrongAccept ? "Zm9ndXM=" : AcceptFor(seen_key_);
-    SendAll(fd,
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Accept: " +
-                accept + "\r\n\r\n");
+    std::string reply =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: " +
+        accept + "\r\n\r\n";
+    if (mode_ == Mode::kPipelinedHeadFrame) {
+      // A frame written in the same buffer as the 101 head: the relay must
+      // capture the bytes past the blank line and still deliver them.
+      reply += ServerFrame(1, "pipelined-then-head");
+    }
+    SendAll(fd, reply);
     handshake_done_ = true;
     if (mode_ == Mode::kWrongAccept) {
       ::close(fd);
@@ -393,6 +407,34 @@ void TestEchoRoundTripAndClose() {
   assert(front.front().cancelled());
 }
 
+void TestHandshakePipelinedFrameReachesFront() {
+  FrontSocket front;
+  FakeWsWorker worker(FakeWsWorker::Mode::kPipelinedHeadFrame);
+  const UpstreamTarget target{"127.0.0.1", worker.port()};
+
+  auto relay = std::async(std::launch::async, [&target, &front] {
+    RelayOutcome outcome;
+    outcome.ok = RelayWebSocket(target, front.front(), &outcome.error);
+    outcome.returned_at = Clock::now();
+    return outcome;
+  });
+
+  assert(worker.WaitForHandshake(std::chrono::seconds(5)));
+
+  // The worker wrote a text frame in the same send as its 101 head. Losing it
+  // would stall this read to the full budget and fail the test.
+  std::string received;
+  assert(ReadRawFrame(front.peer(), &received, std::chrono::seconds(2)));
+  assert(received == ServerFrame(1, "pipelined-then-head"));
+
+  worker.RequestClose();
+  assert(relay.wait_for(std::chrono::milliseconds(200)) ==
+         std::future_status::ready);
+  const RelayOutcome outcome = relay.get();
+  assert(outcome.ok);
+  assert(front.front().cancelled());
+}
+
 void TestWrongAcceptFailsWithoutHang() {
   FrontSocket front;
   FakeWsWorker worker(FakeWsWorker::Mode::kWrongAccept);
@@ -415,6 +457,7 @@ void TestWrongAcceptFailsWithoutHang() {
 
 int main() {
   TestEchoRoundTripAndClose();
+  TestHandshakePipelinedFrameReachesFront();
   TestWrongAcceptFailsWithoutHang();
   std::cout << "All router websocket relay tests passed.\n";
   return 0;

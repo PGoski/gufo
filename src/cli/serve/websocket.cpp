@@ -3,13 +3,14 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <openssl/evp.h>
-#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include <array>
 #include <cctype>
 #include <cerrno>
-#include <chrono>
 #include <cstring>
 
 #include "src/cli/serve/audio_stream.hpp"
@@ -19,7 +20,35 @@ namespace gufo::server {
 namespace {
 constexpr std::size_t kMaximumMessage = 4U << 20;
 constexpr std::size_t kMaximumQueue = 8U << 20;
-constexpr int kDetachPollMs = 20;
+
+// Bounded grace for a reader that has already passed its detach check but has
+// not yet entered the blocking read: the interrupt can be lost only when this
+// shorter read timeout is already installed, so the handover still returns.
+constexpr int kDetachGraceMs = 20;
+
+// A reader parked in the blocking frame read cannot observe the detach request
+// on its own, and neither `shutdown` (which would kill the read side the relay
+// needs) nor an `SO_RCVTIMEO` change wakes a read already in progress. So a
+// dedicated real-time signal, delivered only to that reader thread, interrupts
+// the read with EINTR and the loop exits on the detach request.
+void DetachInterrupt(int) {}
+
+int DetachSignalNumber() {
+  static const int number = (SIGRTMIN + 1 <= SIGRTMAX) ? SIGRTMIN + 1 : SIGUSR1;
+  return number;
+}
+
+void EnsureDetachInterruptHandler() {
+  static const bool installed = [] {
+    struct sigaction action{};
+    action.sa_handler = DetachInterrupt;
+    (void)::sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;  // No SA_RESTART: the read must return EINTR.
+    (void)::sigaction(DetachSignalNumber(), &action, nullptr);
+    return true;
+  }();
+  (void)installed;
+}
 
 bool ValidUtf8(std::string_view text) {
   core::Utf8Decoder decoder;
@@ -111,8 +140,6 @@ WebSocket::~WebSocket() {
 }
 
 bool WebSocket::Read(char* data, std::size_t size) {
-  long long timeout_ms = -2;
-  auto deadline = std::chrono::steady_clock::now();
   while (size != 0 && !closed_.load() && !detached_.load()) {
     if (offset_ < buffered_.size()) {
       const auto count = std::min(size, buffered_.size() - offset_);
@@ -122,46 +149,10 @@ bool WebSocket::Read(char* data, std::size_t size) {
       size -= count;
       continue;
     }
-    if (timeout_ms == -2) {
-      timeval tv{};
-      socklen_t length = sizeof(tv);
-      if (::getsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, &length) == 0) {
-        timeout_ms =
-            static_cast<long long>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
-      } else {
-        timeout_ms = -1;
-      }
-      if (timeout_ms == 0)
-        timeout_ms = -1;
-      if (timeout_ms >= 0)
-        deadline += std::chrono::milliseconds(timeout_ms);
-    }
-    int poll_ms = kDetachPollMs;
-    if (timeout_ms >= 0) {
-      const auto remaining =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              deadline - std::chrono::steady_clock::now())
-              .count();
-      if (remaining <= 0)
-        return false;
-      poll_ms = static_cast<int>(std::min<long long>(remaining, kDetachPollMs));
-    }
-    pollfd slot{fd_, POLLIN, 0};
-    const int ready = ::poll(&slot, 1, poll_ms);
-    if (ready < 0) {
-      if (errno == EINTR)
-        continue;
-      return false;
-    }
-    if (ready == 0)
+    const auto count = ::recv(fd_, data, size, 0);
+    if (count < 0 && errno == EINTR)
       continue;
-    const auto count = ::recv(fd_, data, size, MSG_DONTWAIT);
-    if (count < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-        continue;
-      return false;
-    }
-    if (count == 0)
+    if (count <= 0)
       return false;
     data += count;
     size -= static_cast<std::size_t>(count);
@@ -223,6 +214,17 @@ bool WebSocket::DetachForRelay(int* fd, std::string* pending) {
   pending->clear();
   if (detached_.exchange(true) || closed_.load()) {
     return false;
+  }
+  if (reader_.joinable()) {
+    // Install the short grace timeout before interrupting: a parked read is
+    // woken by the signal, and a signal lost in the window before `recv` is
+    // entered still returns within the grace because the shorter timeout is
+    // already installed. Either way the handover does not wait out the socket
+    // idle timeout, and the relay ignores `SO_RCVTIMEO` once it owns the fd.
+    const timeval grace{kDetachGraceMs / 1000, (kDetachGraceMs % 1000) * 1000};
+    (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &grace, sizeof(grace));
+    EnsureDetachInterruptHandler();
+    (void)::pthread_kill(reader_.native_handle(), DetachSignalNumber());
   }
   reader_.join();
   *pending =

@@ -144,7 +144,10 @@ std::string BuildHandshake(const UpstreamTarget& target, std::string_view key) {
 }
 
 /// Status line plus headers, bounded in time and size like the HTTP relay.
-bool ReadHead(int fd, std::string* head, std::string* error) {
+/// Bytes a worker pipelined after the terminating blank line are handed back
+/// in `remainder` instead of discarded, mirroring the HTTP relay.
+bool ReadHead(int fd, std::string* head, std::string* remainder,
+              std::string* error) {
   const auto deadline = Clock::now() + kHandshakeBudget;
   std::size_t found = std::string::npos;
   while (found == std::string::npos) {
@@ -188,6 +191,8 @@ bool ReadHead(int fd, std::string* head, std::string* error) {
     }
     found = head->find("\r\n\r\n");
   }
+  *remainder = head->substr(found + 4);
+  head->resize(found + 4);
   return true;
 }
 
@@ -281,6 +286,33 @@ struct Direction {
   std::string buffer;
 };
 
+/// Push worker bytes that arrived with the 101 head to the client before the
+/// pump starts, honouring cancellation with the same poll slice as the pump.
+/// False once the front is gone.
+bool WriteToFront(int front_fd, WebSocket& front, std::string_view bytes) {
+  std::string buffer(bytes);
+  while (!buffer.empty()) {
+    if (front.cancelled()) {
+      return false;
+    }
+    pollfd slot{front_fd, POLLOUT, 0};
+    const int ready = ::poll(&slot, 1, kPumpSliceMs);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    if (ready == 0) {
+      continue;
+    }
+    if (!Flush(front_fd, &buffer)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// Raw bidirectional pump. Returns when either side closes, either socket
 /// errors, or the front reports cancellation.
 void Pump(int front_fd, int worker_fd, WebSocket& front, std::string pending) {
@@ -372,7 +404,8 @@ bool RelayWebSocket(const UpstreamTarget& target,
     return false;
   }
   std::string head;
-  if (!ReadHead(worker_fd, &head, &failure)) {
+  std::string remainder;
+  if (!ReadHead(worker_fd, &head, &remainder, &failure)) {
     ::close(worker_fd);
     return false;
   }
@@ -388,6 +421,14 @@ bool RelayWebSocket(const UpstreamTarget& target,
     failure = "worker sent a wrong Sec-WebSocket-Accept";
     ::close(worker_fd);
     return false;
+  }
+
+  // Bytes a worker pipelined with its 101 head belong to the client and must
+  // reach the front before the raw pump, exactly like the HTTP remainder.
+  if (!WriteToFront(front_fd, front, remainder)) {
+    ::close(worker_fd);
+    front.MarkClosed();
+    return true;
   }
 
   // Bytes that arrived with the upgrade request belong to the worker stream.
