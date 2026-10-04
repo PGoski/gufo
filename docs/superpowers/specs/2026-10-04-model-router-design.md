@@ -48,6 +48,7 @@ gufo router --models-preset <FILE>
             [--models-dir <DIR>]
             [--models-max N]            default 2; 0 = unlimited
             [--sleep-idle-seconds SEC]  default 900; 0 disables idle unload
+            [--load-timeout-seconds S]  default 600; 0 = unlimited wait
             [--autoload]                preload preset models at startup
             [--host IP] [--port N] [--api-key KEY]
             [--max-connections N] [--max-request-bytes N]
@@ -110,10 +111,13 @@ model = /models/qwen3-asr
 - Load: first request for a model spawns the worker; requests for the same
   model queue behind readiness. Readiness is `GET /health` returning 200 (503
   means still loading). Pending requests are held, not rejected, matching
-  today's pre-ready `serve` behavior; there is no separate load timeout. A
-  worker that exits with a non-zero status during load fails all held
-  requests with 502 and marks the model unloaded; the next request retries
-  the load.
+  today's pre-ready `serve` behavior. The whole cold-load wait (admission
+  queue plus spawn plus readiness) is bounded by `--load-timeout-seconds`
+  (default 600; 0 disables); on expiry the held requests receive 504
+  `load_timeout`, the worker is terminated with the unload sequence, and the
+  model is marked unloaded so the next request retries the load. A worker
+  that exits with a non-zero status during load fails all held requests with
+  502 and marks the model unloaded; the next request retries the load.
 - Child output: worker stdout/stderr are captured line-wise and re-emitted to
   the router log prefixed with the `model-id`, so `event=...` lines from
   functional tests remain greppable.
@@ -123,8 +127,14 @@ model = /models/qwen3-asr
   SIGTERM, SIGKILL after a 10 s grace.
 - Admission at `--models-max`: the least-recently-active unloadable worker is
   evicted for a new load. If every worker is busy (in-flight request, open
-  WebSocket, unfinished tracked video job), the new-model request receives
-  503 with `Retry-After: 5` and is not queued.
+  WebSocket, unfinished tracked video job), the new-model request is queued
+  for the next free slot instead of rejected: it waits until an active model
+  stops receiving requests and becomes unloadable, then that
+  least-recently-active worker is drained and killed and the queued load
+  starts in FIFO order. The queue wait counts against
+  `--load-timeout-seconds`; on expiry the queued request receives 504
+  `load_timeout`. A busy worker is never evicted while it holds an in-flight
+  request.
 - Worker death while in flight: the affected client streams/connections close
   as they do today when `serve` dies; the model is marked unloaded and the
   next request reloads it.
@@ -182,7 +192,7 @@ further 10 s, exit 0. Children are always killed even on router crash via
 ## Code layout
 
 - New `src/cli/serve/router/`: `preset.{hpp,cpp}` (file → per-section argv +
-  validation), `registry.{hpp,cpp}` (ids, LRU/idle/drain state machine),
+  validation), `registry.{hpp,cpp}` (ids, LRU/idle/drain/admission-queue state machine),
   `workers.{hpp,cpp}` (spawn/health/kill, output capture), `proxy.{hpp,cpp}`
   (HTTP client, SSE relay), `ws_relay.{hpp,cpp}` (WebSocket frame relay),
   `router.cpp` (front wiring into the existing `server::HttpServer` dispatch).
@@ -198,7 +208,8 @@ further 10 s, exit 0. Children are always killed even on router crash via
 | Bad preset (unknown key, bad value, duplicate id, reserved key) | Startup abort, exit 2, section-prefixed parser message |
 | Worker load fails (non-zero exit) | Held requests 502, model unloaded, next request retries |
 | Worker dies mid-request | Streams close as with today's `serve` crash; model unloaded |
-| `--models-max` reached, nothing unloadable | New-model requests 503 + `Retry-After: 5` |
+| `--models-max` reached, nothing unloadable | New-model requests queued FIFO for the next freed slot |
+| Cold load (queue + spawn + readiness) exceeds `--load-timeout-seconds` | Held/queued requests 504 `load_timeout`, worker killed, model unloaded, next request retries |
 | Idle timeout / eviction | Drain-then-kill; no in-flight request is ever cut |
 | GPU `device_lost` in a worker | Existing worker exit path; router treats it as death |
 
@@ -206,13 +217,21 @@ further 10 s, exit 0. Children are always killed even on router crash via
 
 - C++ unit tests: preset parsing (comments, flags, reserved keys, duplicate
   ids, `--models-dir` resolution), registry policy (LRU order, idle timer from
-  stream end, busy exemption incl. video jobs, retry-after on saturation).
+  stream end, busy exemption incl. video jobs, FIFO queueing on saturation and
+  dispatch when a slot frees, `--load-timeout-seconds` expiry for both the
+  admission queue and worker readiness), and simultaneous multi-modality
+  residency: several `asr` + `tts` + `llm` sections loaded at the same time,
+  verifying per-model busy/idle state stays independent, LRU eviction picks
+  across modalities correctly, a busy worker of one modality never delays a
+  load of another beyond the freed-slot wait, and `/v1/models` reports the
+  right `loaded` flags for every modality.
 - Router contract tests on hosted CPU CI (`nix build .#checks.x86_64-linux.pr`)
   with scripted fake workers (a small stdlib HTTP/SSE/WS server in the
   existing Python test tooling): load-on-request with held requests, readiness
   gating, SSE passthrough, WebSocket relay and close propagation, multipart
-  passthrough, `/v1/models` loaded flags, 503 saturation path, graceful
-  eviction, worker-crash handling, `PR_SET_PDEATHSIG` cleanup.
+passthrough, `/v1/models` loaded flags, saturation queueing (load waits for a
+freed slot, 504 on `--load-timeout-seconds` expiry), graceful eviction,
+worker-crash handling, `PR_SET_PDEATHSIG` cleanup.
 - GPU smoke check under `gpu-test` with one small preset (asr + tts, two
   sections) proving cross-modality routing and idle unload on real HIP
   contexts; run only the affected ctest name.
@@ -225,7 +244,8 @@ further 10 s, exit 0. Children are always killed even on router crash via
 
 1. With a 3-section preset and `--models-max 2`, requests to all three models
    succeed; at most 2 workers are alive at any time; no request is ever cut by
-   eviction.
+   eviction; a request for the third model issued while both workers are busy
+   is queued and succeeds when a slot frees.
 2. After `--sleep-idle-seconds` with no traffic, RSS of the router tree drops
    to front-only size (weights unmapped).
 3. A cold request completes with correct output and logs `event=worker_spawn`
