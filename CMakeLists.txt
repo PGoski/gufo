@@ -204,6 +204,7 @@ add_library(gufo_http STATIC
   src/cli/serve/router/proxy.cpp
   src/cli/serve/router/registry.cpp
   src/cli/serve/router/workers.cpp
+  src/cli/serve/router/ws_relay.cpp
   src/cli/serve/serve_options.cpp
   src/cli/serve/image_api.cpp
   src/cli/serve/audio_asr_api.cpp
@@ -392,6 +393,12 @@ if (BUILD_TESTING)
   target_link_libraries(router_workers_test PRIVATE gufo_http)
   add_test(NAME router_workers_test COMMAND router_workers_test)
   set_tests_properties(router_workers_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
+
+  add_executable(router_ws_relay_test tests/cli/router_ws_relay_test.cpp)
+  target_link_libraries(router_ws_relay_test PRIVATE gufo_http)
+  add_test(NAME router_ws_relay_test COMMAND router_ws_relay_test)
+  set_tests_properties(router_ws_relay_test PROPERTIES LABELS "cpu;router"
     TIMEOUT 30)
 
   add_executable(json_constraint_test tests/core/json_constraint_test.cpp)

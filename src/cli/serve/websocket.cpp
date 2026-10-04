@@ -3,11 +3,13 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <openssl/evp.h>
+#include <poll.h>
 #include <sys/socket.h>
 
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 
 #include "src/cli/serve/audio_stream.hpp"
@@ -17,6 +19,7 @@ namespace gufo::server {
 namespace {
 constexpr std::size_t kMaximumMessage = 4U << 20;
 constexpr std::size_t kMaximumQueue = 8U << 20;
+constexpr int kDetachPollMs = 20;
 
 bool ValidUtf8(std::string_view text) {
   core::Utf8Decoder decoder;
@@ -101,12 +104,16 @@ WebSocket::~WebSocket() {
   // Cancellation can wake the consumer before the reader finishes its close
   // reply. Let that writer complete before shutting down the send half.
   (void)::shutdown(fd_, SHUT_RD);
-  reader_.join();
+  if (reader_.joinable()) {
+    reader_.join();
+  }
   (void)::shutdown(fd_, SHUT_RDWR);
 }
 
 bool WebSocket::Read(char* data, std::size_t size) {
-  while (size != 0 && !closed_.load()) {
+  long long timeout_ms = -2;
+  auto deadline = std::chrono::steady_clock::now();
+  while (size != 0 && !closed_.load() && !detached_.load()) {
     if (offset_ < buffered_.size()) {
       const auto count = std::min(size, buffered_.size() - offset_);
       std::memcpy(data, buffered_.data() + offset_, count);
@@ -115,10 +122,46 @@ bool WebSocket::Read(char* data, std::size_t size) {
       size -= count;
       continue;
     }
-    const auto count = ::recv(fd_, data, size, 0);
-    if (count < 0 && errno == EINTR)
+    if (timeout_ms == -2) {
+      timeval tv{};
+      socklen_t length = sizeof(tv);
+      if (::getsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, &length) == 0) {
+        timeout_ms =
+            static_cast<long long>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
+      } else {
+        timeout_ms = -1;
+      }
+      if (timeout_ms == 0)
+        timeout_ms = -1;
+      if (timeout_ms >= 0)
+        deadline += std::chrono::milliseconds(timeout_ms);
+    }
+    int poll_ms = kDetachPollMs;
+    if (timeout_ms >= 0) {
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now())
+              .count();
+      if (remaining <= 0)
+        return false;
+      poll_ms = static_cast<int>(std::min<long long>(remaining, kDetachPollMs));
+    }
+    pollfd slot{fd_, POLLIN, 0};
+    const int ready = ::poll(&slot, 1, poll_ms);
+    if (ready < 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    if (ready == 0)
       continue;
-    if (count <= 0)
+    const auto count = ::recv(fd_, data, size, MSG_DONTWAIT);
+    if (count < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+        continue;
+      return false;
+    }
+    if (count == 0)
       return false;
     data += count;
     size -= static_cast<std::size_t>(count);
@@ -172,6 +215,22 @@ void WebSocket::Close(std::uint16_t code) {
   (void)::shutdown(fd_, SHUT_RD);
 }
 
+bool WebSocket::DetachForRelay(int* fd, std::string* pending) {
+  if (fd == nullptr || pending == nullptr) {
+    return false;
+  }
+  *fd = -1;
+  pending->clear();
+  if (detached_.exchange(true) || closed_.load()) {
+    return false;
+  }
+  reader_.join();
+  *pending =
+      offset_ < buffered_.size() ? buffered_.substr(offset_) : std::string();
+  *fd = fd_;
+  return true;
+}
+
 bool WebSocket::MarkClosed() {
   bool changed;
   {
@@ -200,7 +259,7 @@ void WebSocket::ReadLoop() {
   try {
     std::string message;
     bool fragmented = false;
-    while (!closed_.load()) {
+    while (!closed_.load() && !detached_.load()) {
       std::array<unsigned char, 2> header{};
       if (!Read(reinterpret_cast<char*>(header.data()), 2))
         break;
@@ -305,7 +364,8 @@ void WebSocket::ReadLoop() {
   } catch (const std::exception&) {
     Close(1011);
   }
-  MarkClosed();
+  if (!detached_.load())
+    MarkClosed();
 }
 
 }  // namespace gufo::server
