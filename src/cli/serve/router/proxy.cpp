@@ -322,6 +322,31 @@ bool Refill(int fd, std::string& buffer, const HttpRequest& request) {
   }
 }
 
+/// Largest accepted chunk payload: 1 GiB.
+constexpr std::size_t kMaxChunkBytes = static_cast<std::size_t>(1) << 30;
+
+/// Strict chunk-size parse: only hex digits (extensions stripped by the
+/// caller), non-empty and within kMaxChunkBytes. Rejects anything else,
+/// including values large enough to wrap the size arithmetic.
+bool ParseChunkSize(std::string_view token, std::size_t* size) {
+  if (token.empty() || token.size() > 16) {
+    return false;
+  }
+  for (const char c : token) {
+    if (std::isxdigit(static_cast<unsigned char>(c)) == 0) {
+      return false;
+    }
+  }
+  // At most 16 hex digits, so strtoull cannot wrap or saturate.
+  const unsigned long long value =
+      std::strtoull(std::string(token).c_str(), nullptr, 16);
+  if (value > kMaxChunkBytes) {
+    return false;
+  }
+  *size = static_cast<std::size_t>(value);
+  return true;
+}
+
 void StreamContentLength(int fd, std::string buffer, std::size_t remaining,
                          const HttpResponse::BodyWriter& write,
                          const HttpRequest& request) {
@@ -366,13 +391,10 @@ void StreamChunked(int fd, std::string buffer,
     if (extension != std::string::npos) {
       size_line.resize(extension);
     }
-    char* parse_end = nullptr;
-    const unsigned long long size =
-        std::strtoull(size_line.c_str(), &parse_end, 16);
-    if (parse_end == size_line.c_str()) {
+    std::size_t payload = 0;
+    if (!ParseChunkSize(size_line, &payload)) {
       return;  // corrupt chunk framing
     }
-    const std::size_t payload = static_cast<std::size_t>(size);
     const std::size_t consumed = line_end + 2;
     if (payload == 0) {
       return;  // final chunk; trailers are ignored

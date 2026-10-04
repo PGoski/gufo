@@ -391,12 +391,38 @@ void TestWorkerEofMidBody() {
   assert(Drain(response) == "0123456789");
 }
 
+void TestCorruptChunkSizeEndsStreaming() {
+  // A faulty or dying worker must not crash the relay: only hex-digit sizes
+  // within a sane bound are accepted; anything else stops the stream.
+  for (const char* corrupt_size : {"ZZZ", "FFFFFFFFFFFFFFFF", ""}) {
+    const std::string size_line(corrupt_size);
+    FakeWorker fake([&size_line](int fd) {
+      SendAll(fd,
+              "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+              "Transfer-Encoding: chunked\r\n\r\n");
+      SendAll(fd, Chunk("data: 1\n\n"));
+      // Trailing bytes keep the socket from closing before the relay has
+      // committed to the corrupt size, exercising the parse path itself.
+      SendAll(fd, size_line + "\r\ntaxsliceslice");
+      // Responder returns; FakeWorker closes the connection.
+    });
+
+    const UpstreamTarget target{"127.0.0.1", fake.port()};
+    const HttpResponse response =
+        ProxyToWorker(target, MakeRequest("GET", "/v1/corrupt"));
+    assert(response.status == 200);
+    const std::string collected = Drain(response);  // must not throw or crash
+    assert(collected == "data: 1\n\n");
+  }
+}
+
 int main() {
   TestEchoRoundTrip();
   TestSsePassthrough();
   TestConnectRefused();
   TestCancellationClosesUpstream();
   TestWorkerEofMidBody();
+  TestCorruptChunkSizeEndsStreaming();
   std::cout << "All router proxy tests passed.\n";
   return 0;
 }
