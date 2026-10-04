@@ -97,6 +97,7 @@ LoadDecision Registry::RequestLoad(std::string_view model_id) {
   if (options_.max_active == 0 || ActiveCount() < options_.max_active) {
     return LoadDecision::kSpawn;
   }
+  entry->queued = true;
   return LoadDecision::kQueue;
 }
 
@@ -115,7 +116,7 @@ std::string Registry::EvictionCandidate() {
 
 bool Registry::HasQueued() const {
   for (const auto& entry : entries_) {
-    if (entry.state == State::kUnloaded && entry.deadline_armed) {
+    if (entry.queued) {
       return true;
     }
   }
@@ -158,6 +159,7 @@ void Registry::MarkLoading(std::string_view model_id) {
     return;
   }
   entry->state = State::kLoading;
+  entry->queued = false;
   Touch(*entry);
 }
 
@@ -168,6 +170,7 @@ void Registry::MarkReady(std::string_view model_id) {
   }
   entry->state = State::kReady;
   entry->deadline_armed = false;
+  entry->queued = false;
   Touch(*entry);
 }
 
@@ -178,6 +181,7 @@ void Registry::MarkUnloaded(std::string_view model_id) {
   }
   entry->state = State::kUnloaded;
   entry->deadline_armed = false;
+  entry->queued = false;
   Touch(*entry);
 }
 

@@ -81,6 +81,7 @@ private:
     Clock::time_point last_active{};
     bool deadline_armed{false};
     Clock::time_point deadline{};
+    bool queued{false};
   };
 
   [[nodiscard]] Clock::time_point Now() const;

@@ -122,6 +122,7 @@ void TestLoadTimeout() {
   assert(registry.RequestLoad("c") == LoadDecision::kLoadTimeout);
 
   registry.MarkUnloaded("c");
+  assert(!registry.HasQueued());
   assert(!Contains(registry.DueLoadTimeouts(), "c"));
   assert(registry.RequestLoad("c") == LoadDecision::kQueue);
 
@@ -151,9 +152,17 @@ void TestLoadTimeout() {
   assert(patient.RequestLoad("b") == LoadDecision::kSpawn);
   patient.MarkLoading("b");
   assert(patient.RequestLoad("c") == LoadDecision::kQueue);
+  assert(patient.HasQueued());
   forever_clock.Advance(1000000);
   assert(patient.RequestLoad("c") == LoadDecision::kQueue);
+  assert(patient.HasQueued());
   assert(patient.DueLoadTimeouts().empty());
+  patient.MarkLoading("c");
+  assert(!patient.HasQueued());
+  patient.MarkUnloaded("c");
+  assert(!patient.HasQueued());
+  assert(patient.RequestLoad("c") == LoadDecision::kQueue);
+  assert(patient.HasQueued());
 }
 
 void TestIdleUnload() {
@@ -173,14 +182,22 @@ void TestIdleUnload() {
   clock.Advance(795);
   assert(registry.DueIdleUnloads().empty());
 
-  clock.Advance(500);
-  registry.MarkLoading("b");
-  registry.MarkReady("b");
-
   clock.Advance(106);
   auto due = registry.DueIdleUnloads();
   assert(due.size() == 1);
   assert(due[0] == "a");
+
+  registry.MarkLoading("b");
+  registry.MarkReady("b");
+  clock.Advance(899);
+  due = registry.DueIdleUnloads();
+  assert(due.size() == 1);
+  assert(due[0] == "a");
+
+  clock.Advance(1);
+  due = registry.DueIdleUnloads();
+  assert(due.size() == 2);
+  assert(due[0] == "a" && due[1] == "b");
 }
 
 void TestBusyExemption() {
