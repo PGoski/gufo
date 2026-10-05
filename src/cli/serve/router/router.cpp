@@ -472,6 +472,14 @@ public:
     if (const auto front = RouteFront(registry, req)) {
       return *front;
     }
+    if (req.path.starts_with("/v1/videos/") && req.method != "GET" &&
+        req.method != "DELETE") {
+      // Job subpaths have no verbs beyond the status/content reads the
+      // front's video API answers: everything else is 405 regardless of job
+      // state or body, mirroring HandleVideoApiRequest's precedence.
+      return Err(405, "Method Not Allowed", "method is not allowed",
+                 "invalid_request_error", "method_not_allowed");
+    }
     const Resolution resolution = ResolveModel(req);
     if (resolution.missing) {
       return Err(400, "Bad Request", "missing 'model' field",
@@ -480,16 +488,25 @@ public:
     Resolution resolved = resolution;
     if (resolved.model_id.empty() && server::IsVideoApiPath(req.path) &&
         (req.method == "GET" || req.method == "DELETE")) {
+      const std::string job_id = VideoJobId(req.path);
+      if (req.method == "DELETE" && req.path.ends_with("/content") &&
+          !job_id.empty()) {
+        // The front only serves content reads with GET; shape and method
+        // decide before any job lookup.
+        return Err(405, "Method Not Allowed", "method is not allowed",
+                   "invalid_request_error", "method_not_allowed");
+      }
       // Status/content reads for a recorded job route to its owner model and
       // reload that worker if it died (persisted job state answers again).
-      resolved.model_id = registry.JobOwner(VideoJobId(req.path));
+      resolved.model_id = registry.JobOwner(job_id);
     }
     if (resolved.model_id.empty()) {
-      // Nothing resolved the path to a model: an unrecorded (or malformed)
-      // video job id answers exactly like the front's video API would — 404
-      // video_not_found, 405 for a collection read — while a genuinely
-      // unknown model id on a non-video route keeps the model_not_found
-      // listing and an unknown route stays 404 not_found.
+      // Nothing resolved the path to a model. Video paths mirror the front's
+      // video API precedence: shape and method first (405 above), then the
+      // unrecorded or malformed job id (404 video_not_found without leaking
+      // preset ids, 405 for a collection read). A genuinely unknown model id
+      // on a non-video route keeps the model_not_found listing and an
+      // unknown route stays 404 not_found.
       if (server::IsVideoApiPath(req.path) &&
           (req.method == "GET" || req.method == "DELETE")) {
         if (req.path == "/v1/videos") {
@@ -543,10 +560,9 @@ public:
       // RelayWebSocket itself runs from the 101 callback after this return
       // has released the state mutex, and releases it when either side
       // closes.
-      auto sockets =
-          std::make_shared<HeldWebSocket>(mutex, registry, model_id)->Arm();
+      auto sockets = std::make_shared<HeldWebSocket>(mutex, registry, model_id);
       const std::string ws_model = model_id;
-      return server::UpgradeWebSocket(
+      HttpResponse upgrade = server::UpgradeWebSocket(
           req, [target, ws_model, sockets](server::WebSocket& front) {
             std::string error;
             if (!router::RelayWebSocket(target, front, &error)) {
@@ -555,6 +571,11 @@ public:
             }
             sockets->Release();
           });
+      // Arm as the last fallible step: anything throwing above unwinds an
+      // unarmed guard (Release is a no-op), so no throw path can destroy an
+      // armed guard and self-lock the still-held state mutex.
+      sockets->Arm();
+      return upgrade;
     }
     auto busy = std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm();
     // The relay blocks while connecting and reading upstream headers, so it

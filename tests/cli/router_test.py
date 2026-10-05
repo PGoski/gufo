@@ -1205,6 +1205,21 @@ def run_cases(binary, tmp_root, ready_dir):
         assert status == 404, (status, payload, router.tail_log())
         assert json.loads(payload)["error"]["code"] == "video_not_found", \
             payload
+        # Verb precedence matches the front: job subpaths reject every verb
+        # outside the status/content reads, and content is GET-only even for
+        # an unrecorded id (shape+method decide before job lookup).
+        for method, path in (("PUT", "/v1/videos/nope"),
+                             ("POST", "/v1/videos/nope"),
+                             ("DELETE", "/v1/videos/nope/content")):
+            status, payload = router.request(method, path)
+            assert status == 405, (method, path, status, payload,
+                                   router.tail_log())
+            assert json.loads(payload)["error"]["code"] == \
+                "method_not_allowed", (method, payload)
+        status, payload = router.request("GET", "/v1/videos/nope/content")
+        assert status == 404, (status, payload, router.tail_log())
+        assert json.loads(payload)["error"]["code"] == "video_not_found", \
+            payload
         # A recorded job on a live worker still resolves by job id.
         status, payload = router.request(
             "POST", "/v1/videos", {"model": "mv", "prompt": "z"})
