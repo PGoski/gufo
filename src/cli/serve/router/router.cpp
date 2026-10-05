@@ -28,9 +28,11 @@
 #include "src/cli/serve/router/proxy.hpp"
 #include "src/cli/serve/router/registry.hpp"
 #include "src/cli/serve/router/workers.hpp"
+#include "src/cli/serve/router/ws_relay.hpp"
 #include "src/cli/serve/serve.hpp"
 #include "src/cli/serve/serve_options.hpp"
 #include "src/cli/serve/video_api.hpp"
+#include "src/cli/serve/websocket.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::cli {
@@ -190,6 +192,13 @@ bool IsIntrospectionPath(const std::string& path) {
          path == "/metrics";
 }
 
+/// The WebSocket-routed paths from the spec resolution table; their model
+/// comes from the `model` query parameter (ResolveModel).
+bool IsWebSocketPath(const HttpRequest& req) {
+  return req.method == "GET" &&
+         (req.path == "/v1/realtime" || req.path == "/v1/audio/speech/stream");
+}
+
 /// Job id from `/v1/videos/<id>` or `/v1/videos/<id>/content`, matching the
 /// shape video_api.cpp serves (ParseVideoPath).
 std::string VideoJobId(const std::string& path) {
@@ -221,8 +230,7 @@ Resolution ResolveModel(const HttpRequest& req) {
     resolution.missing = resolution.model_id.empty();
     return resolution;
   }
-  if (req.method == "GET" &&
-      (req.path == "/v1/realtime" || req.path == "/v1/audio/speech/stream")) {
+  if (IsWebSocketPath(req)) {
     resolution.model_id = req.query_param("model");
     resolution.missing = resolution.model_id.empty();
     return resolution;
@@ -261,6 +269,44 @@ public:
     std::lock_guard<std::mutex> lock(mutex_);
     armed_ = false;
     registry_.RequestFinished(model_id_);
+  }
+
+private:
+  std::mutex& mutex_;
+  router::Registry& registry_;
+  std::string model_id_;
+  bool armed_{false};
+};
+
+/// Holds a model's open-socket count for one relayed WebSocket. `Arm` runs
+/// with the router mutex held so the worker is eviction- and idle-unload-
+/// exempt before the 101 reaches the client; the front releases it when the
+/// relay returns, and the destructor covers a response that is dropped
+/// without the callback ever being served (failed 101 write). `Release` takes
+/// the mutex itself because the relay finishes on a request thread with the
+/// state lock free.
+class HeldWebSocket : public std::enable_shared_from_this<HeldWebSocket> {
+public:
+  HeldWebSocket(std::mutex& mutex, router::Registry& registry,
+                std::string model_id)
+      : mutex_(mutex), registry_(registry), model_id_(std::move(model_id)) {}
+  HeldWebSocket(const HeldWebSocket&) = delete;
+  HeldWebSocket& operator=(const HeldWebSocket&) = delete;
+  ~HeldWebSocket() { Release(); }
+
+  std::shared_ptr<HeldWebSocket> Arm() {
+    registry_.WebSocketOpened(model_id_);
+    armed_ = true;
+    return shared_from_this();
+  }
+
+  void Release() {
+    if (!armed_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = false;
+    registry_.WebSocketClosed(model_id_);
   }
 
 private:
@@ -439,11 +485,19 @@ public:
       resolved.model_id = registry.JobOwner(VideoJobId(req.path));
     }
     if (resolved.model_id.empty()) {
-      // Nothing resolved the path to a model: an unrecorded video job (404
-      // listing preset ids) or an unknown route (404 not_found).
+      // Nothing resolved the path to a model: an unrecorded (or malformed)
+      // video job id answers exactly like the front's video API would — 404
+      // video_not_found, 405 for a collection read — while a genuinely
+      // unknown model id on a non-video route keeps the model_not_found
+      // listing and an unknown route stays 404 not_found.
       if (server::IsVideoApiPath(req.path) &&
           (req.method == "GET" || req.method == "DELETE")) {
-        return ModelNotFoundError();
+        if (req.path == "/v1/videos") {
+          return Err(405, "Method Not Allowed", "method is not allowed",
+                     "invalid_request_error", "method_not_allowed");
+        }
+        return Err(404, "Not Found", "video job not found",
+                   "invalid_request_error", "video_not_found");
       }
       return Err(404, "Not Found", "no route for this path",
                  "invalid_request_error", "not_found");
@@ -452,6 +506,17 @@ public:
     const router::PresetModel* preset = registry.Find(model_id);
     if (preset == nullptr) {
       return ModelNotFoundError();
+    }
+    const bool ws_relay =
+        IsWebSocketPath(req) && server::IsWebSocketUpgrade(req);
+    if (ws_relay) {
+      // Validate the upgrade handshake before admission so a malformed
+      // WebSocket request never spawns or wakes a worker. The identical
+      // UpgradeWebSocket call below is guaranteed to yield the 101 head.
+      const HttpResponse handshake = server::UpgradeWebSocket(req, nullptr);
+      if (handshake.status != 101) {
+        return handshake;
+      }
     }
     if (IsIntrospectionPath(req.path) && req.method == "GET" &&
         !LoadedLocked(model_id)) {
@@ -469,10 +534,29 @@ public:
       return std::move(*failed);
     }
     const int worker_port = std::get<int>(admitted);
-    auto busy = std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm();
     router::UpstreamTarget target;
     target.host = "127.0.0.1";
     target.port = worker_port;
+    if (ws_relay) {
+      // Same lock discipline as the HTTP relay below: the socket count is
+      // armed here (worker stays resident and eviction-exempt), while
+      // RelayWebSocket itself runs from the 101 callback after this return
+      // has released the state mutex, and releases it when either side
+      // closes.
+      auto sockets =
+          std::make_shared<HeldWebSocket>(mutex, registry, model_id)->Arm();
+      const std::string ws_model = model_id;
+      return server::UpgradeWebSocket(
+          req, [target, ws_model, sockets](server::WebSocket& front) {
+            std::string error;
+            if (!router::RelayWebSocket(target, front, &error)) {
+              Logger::Warn("router", "event=ws_relay_end model=" + ws_model +
+                                         " error=" + error);
+            }
+            sockets->Release();
+          });
+    }
+    auto busy = std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm();
     // The relay blocks while connecting and reading upstream headers, so it
     // runs with the lock free; the busy count keeps the worker resident.
     lock.unlock();
@@ -990,6 +1074,10 @@ int RunRouter(std::span<const char* const> args) {
   options.max_request_body_bytes = max_request_body_bytes;
   options.max_connections = max_connections;
   options.api_key = api_key;
+  // SIGTERM only stops the listener here; the drain below keeps established
+  // connections (and their relays) alive until they finish or the drain
+  // window ends, instead of the front severing them on the signal.
+  options.graceful_shutdown = true;
   options.dispatcher = [state](const HttpRequest& request) {
     return state->Dispatch(request);
   };

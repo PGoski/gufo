@@ -1461,7 +1461,15 @@ void HttpServer::run(bool handle_signals) {
       if (signal != 0) {
         Logger::Info("server", "event=shutdown_requested signal=" +
                                    std::to_string(signal));
-        stop();
+        // A graceful front (the router) keeps established connections for
+        // its own drain; stop() would shut their descriptors down and cut
+        // in-flight streams mid-relay. The destructor stops them once the
+        // drain has ended.
+        if (options_.graceful_shutdown) {
+          stop_listening();
+        } else {
+          stop();
+        }
         break;
       }
     }
@@ -1518,13 +1526,17 @@ void HttpServer::run(bool handle_signals) {
   reap_workers();
 }
 
-void HttpServer::stop() {
-  const bool was_stopped = stopped_.exchange(true, std::memory_order_acq_rel);
-  if (!was_stopped && listen_fd_ >= 0) {
+void HttpServer::stop_listening() {
+  stopped_.store(true, std::memory_order_release);
+  if (listen_fd_ >= 0) {
     // Keep the descriptor owned until destruction: run() may still be inside
     // accept(). Closing here allows it to observe a reused descriptor.
     (void)::shutdown(listen_fd_, SHUT_RDWR);
   }
+}
+
+void HttpServer::stop() {
+  stop_listening();
 
   std::vector<std::unique_ptr<ConnectionWorker>> workers;
   {

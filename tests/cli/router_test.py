@@ -9,6 +9,8 @@ Timings are recorded and printed (event=router_timing), never asserted
 against absolute values, per the repository timing rules.
 """
 
+import base64
+import hashlib
 import http.client
 import itertools
 import json
@@ -25,6 +27,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Fake-worker environment (inherited through the router into every worker):
 #   GUFO_FAKE_READY_DELAY  default /health ready delay in seconds
@@ -130,7 +134,80 @@ def serve_fake_worker():
             self.end_headers()
             self.wfile.write(body)
 
+        def ws_read(self, count):
+            data = b""
+            while len(data) < count:
+                chunk = self.rfile.read(count - len(data))
+                if not chunk:
+                    raise ConnectionError("websocket peer went away")
+                data += chunk
+            return data
+
+        def ws_recv_frame(self):
+            head = self.ws_read(2)
+            opcode = head[0] & 0x0F
+            masked = head[1] & 0x80
+            length = head[1] & 0x7F
+            if length == 126:
+                length = int.from_bytes(self.ws_read(2), "big")
+            elif length == 127:
+                length = int.from_bytes(self.ws_read(8), "big")
+            key = self.ws_read(4) if masked else b""
+            payload = self.ws_read(length) if length else b""
+            if masked:
+                payload = bytes(b ^ key[i % 4]
+                                for i, b in enumerate(payload))
+            return opcode, payload
+
+        def ws_send(self, opcode, payload):
+            out = bytearray([0x80 | opcode])
+            size = len(payload)
+            if size < 126:
+                out.append(size)
+            elif size < 0x10000:
+                out.append(126)
+                out += size.to_bytes(2, "big")
+            else:
+                out.append(127)
+                out += size.to_bytes(8, "big")
+            out += payload
+            self.wfile.write(bytes(out))
+            self.wfile.flush()
+
+        def handle_ws(self):
+            # Minimal RFC 6455 echo: complete the upgrade against whatever
+            # key the front relayed, then echo text/binary frames back and
+            # close cleanly on a close frame. Server frames stay unmasked;
+            # 7-bit, 16-bit and 64-bit lengths are read, only 7/16-bit are
+            # produced (echo payloads here are short).
+            key = self.headers.get("Sec-WebSocket-Key", "")
+            accept = base64.b64encode(hashlib.sha1(
+                (key + WS_GUID).encode()).digest()).decode()
+            self.send_response(101, "Switching Protocols")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept)
+            self.end_headers()
+            try:
+                while True:
+                    opcode, payload = self.ws_recv_frame()
+                    if opcode == 0x8:
+                        self.ws_send(0x8, b"")
+                        break
+                    if opcode in (0x1, 0x2):
+                        self.ws_send(opcode, payload)
+            except (OSError, ConnectionError):
+                pass
+            # The connection is no longer HTTP; keep the request handler
+            # from looping and let finish() close the socket.
+            self.close_connection = True
+
         def do_GET(self):
+            if (self.headers.get("Upgrade", "").lower() == "websocket"
+                    and "upgrade" in
+                    self.headers.get("Connection", "").lower()):
+                self.handle_ws()
+                return
             path, _ = self.split_path()
             if path == "/health":
                 if time.monotonic() - started < ready_delay():
@@ -331,6 +408,13 @@ class RouterProcess:
             return "<no log>"
         return data[-2000:].decode("utf-8", "replace")
 
+    def log_contains(self, needle):
+        try:
+            with open(self.log_path, "rb") as handle:
+                return needle in handle.read().decode("utf-8", "replace")
+        except OSError:
+            return False
+
     def close(self):
         self.proc.terminate()
         try:
@@ -365,6 +449,82 @@ def pid_gone(pid):
     except PermissionError:
         return False
     return False
+
+
+def proc_dead(pid):
+    """True when the pid is gone or only a zombie. After the router itself
+    is SIGKILLed nobody can wait() its workers, so the PDEATHSIG-killed
+    worker may linger as a zombie until the container's init collects it.
+    A zombie runs no code, holds no socket and maps no weights, so it
+    satisfies the PR_SET_PDEATHSIG contract even though kill(pid, 0)
+    still succeeds."""
+    if pid_gone(pid):
+        return True
+    try:
+        with open("/proc/{}/stat".format(pid)) as handle:
+            remainder = handle.read().rsplit(") ", 1)
+    except OSError:
+        return True
+    return len(remainder) == 2 and remainder[1].split()[0] == "Z"
+
+
+class WsClient:
+    """Minimal raw RFC 6455 client: handshake, masked frames, unmasked in."""
+
+    def __init__(self, port, path):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+        self.f = self.sock.makefile("rb")
+        self.key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ).format(path, self.key).encode())
+        head = b""
+        while not head.endswith(b"\r\n\r\n"):
+            line = self.f.readline()
+            assert line, "websocket handshake closed early"
+            head += line
+        self.head = head
+        assert b" 101" in head.split(b"\r\n", 1)[0], head
+        expect = base64.b64encode(hashlib.sha1(
+            (self.key + WS_GUID).encode()).digest()).decode()
+        assert expect.encode() in head, (head, expect)
+
+    def send_text(self, text):
+        payload = text.encode()
+        assert len(payload) < 126, "test frames stay in the 7-bit form"
+        mask = os.urandom(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(bytes(bytearray([0x81, 0x80 | len(payload)])
+                                + mask + masked))
+
+    def _read(self, count):
+        data = b""
+        while len(data) < count:
+            chunk = self.f.read(count - len(data))
+            assert chunk, "websocket stream ended mid-frame"
+            data += chunk
+        return data
+
+    def recv_frame(self):
+        head = self._read(2)
+        opcode = head[0] & 0x0F
+        length = head[1] & 0x7F
+        if length == 126:
+            length = int.from_bytes(self._read(2), "big")
+        elif length == 127:
+            length = int.from_bytes(self._read(8), "big")
+        return opcode, self._read(length) if length else b""
+
+    def close(self):
+        mask = os.urandom(4)
+        try:
+            self.sock.sendall(bytes(bytearray([0x88, 0x80]) + mask))
+            self.recv_frame()  # close echo
+        except (AssertionError, OSError):
+            pass
+        self.sock.close()
 
 
 FAKE_EXE = None
@@ -733,6 +893,331 @@ def run_cases(binary, tmp_root, ready_dir):
         assert status == 200, (status, payload, router.tail_log())
         assert json.loads(payload)["model"] == "wuss", payload
         assert len(router.spawns("wuss")) == 2, router.spawns("wuss")
+
+    # Case 11 (case_11_ws_relay): WebSocket relay end to end. The upgrade on
+    # /v1/realtime?model=<id> completes, a masked text frame echoes back, the
+    # close handshake is clean, and the open-socket count is released: with
+    # --models-max 1 a following probe for another model queues, evicts the
+    # now-idle ws worker and admits long before any join deadline.
+    ws_two = ("[llm/wa]\nmodel = fake.gguf\n"
+              "[llm/wb]\nmodel = fake.gguf\n")
+    with RouterProcess(binary, tmp_root, ws_two,
+                       extra_args=["--models-max", "1"],
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="wsrelay") as router:
+        try:
+            client = WsClient(router.port, "/v1/realtime?model=wa")
+            client.send_text("ping-9")
+            opcode, payload = client.recv_frame()
+        except AssertionError as exc:
+            raise AssertionError("case_11_ws_relay: {}: {}".format(
+                exc, router.tail_log())) from exc
+        assert opcode == 0x1 and payload == b"ping-9", \
+            (opcode, payload, router.tail_log())
+        assert router.loaded_map().get("wa") is True, router.tail_log()
+        client.close()
+        probe = {}
+
+        def probe_wb():
+            probe["result"] = router.request(
+                "POST", "/v1/chat/completions",
+                {"model": "wb", "messages": []})
+
+        probe_thread = threading.Thread(target=probe_wb, daemon=True)
+        probe_started = time.monotonic()
+        probe_thread.start()
+        probe_thread.join(timeout=30)
+        assert not probe_thread.is_alive(), \
+            ("probe stuck: ws open-socket count never released",
+             router.tail_log())
+        status, payload = probe["result"]
+        assert status == 200, (status, payload, router.tail_log())
+        assert json.loads(payload)["model"] == "wb", payload
+        print("event=router_timing ws_probe_admit_ms={:.1f}".format(
+            (time.monotonic() - probe_started) * 1000.0))
+        assert poll_until(
+            lambda: router.log_contains("event=evict model=wa"), 8.0), \
+            ("ws worker was never freed for the queued probe",
+             router.tail_log())
+
+    # Case 12 (case_12_ws_eviction_exempt): an open WebSocket keeps its
+    # worker eviction-exempt (registry: open_sockets -> Busy; spec "Routing
+    # and proxying" busy workers are never cut). max 2: ws on xa, a held SSE
+    # on xb, so xc queues behind two exempt workers while the ws stays
+    # open, and admits only after the ws closes (eviction then takes the
+    # ws worker itself, now idle, never the still-busy xb).
+    ws_three = ("[llm/xa]\nmodel = fake.gguf\n"
+                "[llm/xb]\nmodel = fake.gguf\n"
+                "[llm/xc]\nmodel = fake.gguf\n")
+    with RouterProcess(binary, tmp_root, ws_three,
+                       extra_args=["--models-max", "2"],
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="wsexempt") as router:
+        try:
+            client = WsClient(router.port,
+                              "/v1/audio/speech/stream?model=xa")
+            client.send_text("hold")
+            echoed = client.recv_frame()
+        except AssertionError as exc:
+            raise AssertionError("case_12_ws_eviction_exempt: {}: {}".format(
+                exc, router.tail_log())) from exc
+        assert echoed == (0x1, b"hold"), (echoed, router.tail_log())
+        held = {}
+        release = threading.Event()
+
+        def hold_stream():
+            conn, response = router.open_stream(
+                "/v1/chat/completions?stream=true&hold=40&chunks=40",
+                {"model": "xb", "messages": []})
+            response.readline()
+            held["conn"] = conn
+            held["response"] = response
+            release.wait()
+            try:
+                response.read()
+            except (OSError, ValueError, http.client.HTTPException):
+                # fp.close() from the main thread makes read() raise on the
+                # closed buffered file; the disconnect itself is the point.
+                pass
+            conn.close()
+
+        holder = threading.Thread(target=hold_stream, daemon=True)
+        holder.start()
+        assert poll_until(lambda: "response" in held, 30.0), \
+            ("held stream never started", router.tail_log())
+        queued = {}
+
+        def queue_third():
+            queued["result"] = router.request(
+                "POST", "/v1/chat/completions",
+                {"model": "xc", "messages": []})
+
+        waiter = threading.Thread(target=queue_third, daemon=True)
+        waiter.start()
+        # While the ws is open nothing is unloadable, so xc must stay
+        # queued and xa must never be evicted (a broken exemption would
+        # have admitted xc within a supervision tick).
+        observe_until = time.monotonic() + 2.0
+        while time.monotonic() < observe_until:
+            assert waiter.is_alive(), \
+                ("xc admitted while the ws worker was exempt",
+                 queued, router.tail_log())
+            assert not router.log_contains("event=evict model=xa"), \
+                ("ws worker was evicted while the socket was open",
+                 router.tail_log())
+            time.sleep(0.1)
+        assert router.loaded_map().get("xc") is False, router.tail_log()
+        client.close()
+        waiter.join(timeout=30)
+        assert not waiter.is_alive(), \
+            ("xc never admitted after the ws closed", router.tail_log())
+        status, payload = queued["result"]
+        assert status == 200, (status, payload, router.tail_log())
+        assert json.loads(payload)["model"] == "xc", payload
+        xa_pids = router.spawns("xa")
+        assert poll_until(lambda: all(pid_gone(pid) for pid in xa_pids),
+                          10.0), ("eviction did not take the freed ws "
+                                  "worker", xa_pids, router.tail_log())
+        loaded = router.loaded_map()
+        assert loaded == {"xa": False, "xb": True, "xc": True}, loaded
+        release.set()
+        # End the held stream the way a disconnect would (case 7 mechanics).
+        try:
+            held["response"].fp.close()
+        except OSError:
+            pass
+        holder.join(timeout=30)
+        assert not holder.is_alive(), router.tail_log()
+
+    # Case 13 (case_13_worker_crash_mid_sse): the worker dies mid-relay
+    # after headers were forwarded. The client stream ends, the router
+    # stays alive, the model is marked unloaded, the exit is logged, and
+    # the next request reloads a fresh worker.
+    with RouterProcess(binary, tmp_root, "[llm/cx]\nmodel = fake.gguf\n",
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="crash") as router:
+        conn, response = router.open_stream(
+            "/v1/chat/completions?stream=true&hold=15&chunks=15",
+            {"model": "cx", "messages": []})
+        first = response.readline()
+        assert first.startswith(b"data:"), (first, router.tail_log())
+        pids = router.spawns("cx")
+        assert pids, router.tail_log()
+        os.kill(pids[-1], signal.SIGKILL)
+        body = response.read()
+        conn.close()
+        assert b"[DONE]" not in body, \
+            ("stream completed although its worker was killed", body,
+             router.tail_log())
+        status, payload = router.request("GET", "/v1/models")
+        assert status == 200, (status, payload, router.tail_log())
+        assert poll_until(
+            lambda: router.log_contains("event=worker_exit model=cx"),
+            10.0), ("no worker_exit line for the crashed worker",
+                    router.tail_log())
+        assert poll_until(
+            lambda: router.loaded_map().get("cx") is False, 10.0), \
+            ("crashed model still reported loaded", router.tail_log())
+        status, payload = router.request(
+            "POST", "/v1/chat/completions",
+            {"model": "cx", "messages": []})
+        assert status == 200, (status, payload, router.tail_log())
+        assert json.loads(payload)["model"] == "cx", payload
+        assert len(router.spawns("cx")) == 2, router.spawns("cx")
+
+    # Case 14 (case_14_idle_unload): --sleep-idle-seconds 1 unloads the
+    # worker after one hot request; the pid dies and /v1/models reports
+    # loaded=false. The bound is generous; the elapsed value is only
+    # printed (event=router_timing), never asserted.
+    with RouterProcess(binary, tmp_root, "[llm/zi]\nmodel = fake.gguf\n",
+                       extra_args=["--sleep-idle-seconds", "1"],
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="idle") as router:
+        status, payload = router.request(
+            "POST", "/v1/chat/completions",
+            {"model": "zi", "messages": []})
+        assert status == 200, (status, payload, router.tail_log())
+        pid = router.spawns("zi")[-1]
+        unload_started = time.monotonic()
+        assert poll_until(lambda: pid_gone(pid), 10.0), \
+            ("idle worker survived --sleep-idle-seconds 1", pid,
+             router.tail_log())
+        print("event=router_timing idle_unload_ms={:.1f}".format(
+            (time.monotonic() - unload_started) * 1000.0))
+        assert poll_until(
+            lambda: router.loaded_map().get("zi") is False, 10.0), \
+            ("idle-unloaded model still reported loaded", router.tail_log())
+
+    # Case 15 (case_15_evicts_idle_worker): 3 models, max 2, idle A (no
+    # held streams, default 900 s idle timeout so eviction is the only
+    # unload path). Hot A, hot B fills the slots; C queues and the
+    # supervision thread evicts the LRU idle worker A, never B.
+    evict_three = ("[llm/ea]\nmodel = fake.gguf\n"
+                   "[llm/eb]\nmodel = fake.gguf\n"
+                   "[llm/ec]\nmodel = fake.gguf\n")
+    with RouterProcess(binary, tmp_root, evict_three,
+                       extra_args=["--models-max", "2"],
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="evict") as router:
+        for model in ("ea", "eb"):
+            status, payload = router.request(
+                "POST", "/v1/chat/completions",
+                {"model": model, "messages": []})
+            assert status == 200, (model, status, payload,
+                                   router.tail_log())
+        ea_pids = router.spawns("ea")
+        assert ea_pids, router.tail_log()
+        queued = {}
+
+        def request_third():
+            queued["result"] = router.request(
+                "POST", "/v1/chat/completions",
+                {"model": "ec", "messages": []})
+
+        waiter = threading.Thread(target=request_third, daemon=True)
+        waiter.start()
+        waiter.join(timeout=30)
+        assert not waiter.is_alive(), \
+            ("queued C never admitted behind two idle workers",
+             router.tail_log())
+        status, payload = queued["result"]
+        assert status == 200, (status, payload, router.tail_log())
+        assert json.loads(payload)["model"] == "ec", payload
+        assert poll_until(
+            lambda: all(pid_gone(pid) for pid in ea_pids), 10.0), \
+            ("idle A was not evicted for C", ea_pids, router.tail_log())
+        assert poll_until(
+            lambda: router.log_contains("event=evict model=ea"), 10.0), \
+            router.tail_log()
+        loaded = router.loaded_map()
+        assert loaded == {"ea": False, "eb": True, "ec": True}, loaded
+
+    # Case 16 (case_16_pdeathsig): killing the router with SIGKILL must
+    # take its workers with it via PR_SET_PDEATHSIG.
+    with RouterProcess(binary, tmp_root, "[llm/pd]\nmodel = fake.gguf\n",
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="pdeath") as router:
+        status, payload = router.request(
+            "POST", "/v1/chat/completions",
+            {"model": "pd", "messages": []})
+        assert status == 200, (status, payload, router.tail_log())
+        pid = router.spawns("pd")[-1]
+        router.proc.kill()
+        router.proc.wait(timeout=15)
+        death_started = time.monotonic()
+        assert poll_until(lambda: proc_dead(pid), 3.0), \
+            ("worker survived router SIGKILL (PR_SET_PDEATHSIG)", pid,
+             router.tail_log())
+        print("event=router_timing pdeathsig_ms={:.1f}".format(
+            (time.monotonic() - death_started) * 1000.0))
+
+    # Case 17 (case_17_graceful_shutdown): SIGTERM during an in-flight SSE
+    # stream. The stream completes fully (terminal [DONE] chunk), the
+    # router exits 0 within its drain window, and no worker survives. The
+    # drain runs with the state lock free and keeps proxying the loaded
+    # model, so this must not be weakened to a kill-then-check case.
+    with RouterProcess(binary, tmp_root, "[llm/gs]\nmodel = fake.gguf\n",
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="shutdown") as router:
+        conn, response = router.open_stream(
+            "/v1/chat/completions?stream=true&hold=3&chunks=6",
+            {"model": "gs", "messages": []})
+        first = response.readline()
+        assert first.startswith(b"data:"), (first, router.tail_log())
+        pid = router.spawns("gs")[-1]
+        router.proc.terminate()
+        body = response.read()
+        conn.close()
+        assert b"[DONE]" in body, \
+            ("in-flight stream was cut by SIGTERM", body,
+             router.tail_log())
+        exit_started = time.monotonic()
+        exited = router.proc.wait(timeout=15)
+        print("event=router_timing graceful_exit_ms={:.1f}".format(
+            (time.monotonic() - exit_started) * 1000.0))
+        assert exited == 0, (exited, router.tail_log())
+        assert poll_until(lambda: pid_gone(pid), 10.0), \
+            ("worker survived graceful shutdown", pid, router.tail_log())
+
+    # M-5 video error-code parity: unrecorded and malformed job reads
+    # answer exactly like video_api.cpp (404 video_not_found), a
+    # collection read is 405 method_not_allowed, and a genuinely unknown
+    # model on a non-video route keeps 404 model_not_found listing the
+    # preset ids.
+    with RouterProcess(binary, tmp_root, "[llm/mv]\nmodel = fake.gguf\n",
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="videoerr") as router:
+        status, payload = router.request("GET", "/v1/videos")
+        assert status == 405, (status, payload, router.tail_log())
+        error = json.loads(payload)["error"]
+        assert error["code"] == "method_not_allowed", payload
+        assert error["type"] == "invalid_request_error", payload
+        for method in ("GET", "DELETE"):
+            status, payload = router.request(method, "/v1/videos/nope")
+            assert status == 404, (method, status, payload,
+                                   router.tail_log())
+            error = json.loads(payload)["error"]
+            assert error["code"] == "video_not_found", payload
+            assert error["type"] == "invalid_request_error", payload
+            assert "mv" not in error["message"], \
+                ("job 404 must not list preset ids", payload)
+        status, payload = router.request("GET", "/v1/videos/a/b")
+        assert status == 404, (status, payload, router.tail_log())
+        assert json.loads(payload)["error"]["code"] == "video_not_found", \
+            payload
+        # A recorded job on a live worker still resolves by job id.
+        status, payload = router.request(
+            "POST", "/v1/videos", {"model": "mv", "prompt": "z"})
+        assert status == 200, (status, payload, router.tail_log())
+        job_id = json.loads(payload)["id"]
+        status, payload = router.request("GET", "/v1/videos/" + job_id)
+        assert status == 200, (status, payload, router.tail_log())
+        # Unknown model on a non-video route keeps the listing behavior.
+        status, payload = router.request("GET", "/v1/slots?model=ghost")
+        assert status == 404, (status, payload, router.tail_log())
+        error = json.loads(payload)["error"]
+        assert error["code"] == "model_not_found", payload
+        assert "mv" in error["message"], payload
 
 
 if __name__ == "__main__":
