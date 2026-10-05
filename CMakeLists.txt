@@ -440,6 +440,12 @@ if (BUILD_TESTING)
       $<TARGET_FILE:gufo>)
   set_tests_properties(serve_cli_test PROPERTIES LABELS "cpu;server;cli" TIMEOUT 30)
 
+  add_test(NAME router_contract_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_test.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(router_contract_test PROPERTIES
+    LABELS "cpu;server;router" TIMEOUT 120)
+
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
 
