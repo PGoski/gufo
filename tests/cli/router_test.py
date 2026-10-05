@@ -10,9 +10,11 @@ against absolute values, per the repository timing rules.
 """
 
 import http.client
+import itertools
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -30,6 +32,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #   GUFO_FAKE_SPAWN_LOG    append "<model> <pid>" once per process start
 #   GUFO_FAKE_EXIT_DIR     one-shot: on the first 200 /health remove
 #                          <dir>/<model>.exit and exit(0) right after
+#   GUFO_FAKE_REFUSE_DIR   per-model: while <dir>/<model>.refuse exists,
+#                          non-/health requests close the connection with no
+#                          response bytes, as a dead upstream would
 
 
 def multipart_field(body, name):
@@ -78,6 +83,8 @@ def serve_fake_worker():
             model = argv[index + 1]
     port = int(os.environ["GUFO_PORT"])
     started = time.monotonic()
+    refuse_dir = os.environ.get("GUFO_FAKE_REFUSE_DIR")
+    job_seq = itertools.count(1)
 
     def ready_delay():
         delay = float(os.environ.get("GUFO_FAKE_READY_DELAY") or "0")
@@ -105,6 +112,16 @@ def serve_fake_worker():
             path, _, query = self.path.partition("?")
             return path, urllib.parse.parse_qs(query)
 
+        def refusing(self):
+            return bool(refuse_dir) and os.path.exists(
+                os.path.join(refuse_dir, model + ".refuse"))
+
+        def send_refused(self):
+            # Fail the proxied request the way a dead upstream does: hang up
+            # without a single response byte.
+            self.close_connection = True
+            self.connection.close()
+
         def send_json(self, status, payload):
             body = json.dumps(payload).encode()
             self.send_response(status)
@@ -131,10 +148,18 @@ def serve_fake_worker():
                         pass
                     os._exit(0)
                 return
+            if self.refusing():
+                self.send_refused()
+                return
             if path in ("/v1/slots", "/slots", "/v1/metrics", "/metrics",
                         "/v1/realtime",
                         "/v1/audio/speech/stream"):
                 self.send_json(200, {"model": model, "path": path})
+                return
+            if path.startswith("/v1/videos/"):
+                self.send_json(200, {"id": path.rsplit("/", 1)[-1],
+                                     "object": "video",
+                                     "status": "completed", "model": model})
                 return
             self.send_json(404, {"error": {"message": "not found",
                                            "type": "invalid_request_error",
@@ -161,10 +186,32 @@ def serve_fake_worker():
             except OSError:
                 pass
 
+        def do_DELETE(self):
+            path, _ = self.split_path()
+            if self.refusing():
+                self.send_refused()
+                return
+            if path.startswith("/v1/videos/"):
+                self.send_json(200, {"id": path.rsplit("/", 1)[-1],
+                                     "object": "video", "deleted": True,
+                                     "model": model})
+                return
+            self.send_json(404, {"error": {"message": "not found",
+                                           "type": "invalid_request_error",
+                                           "code": "not_found"}})
+
         def do_POST(self):
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b""
             path, params = self.split_path()
+            if self.refusing():
+                self.send_refused()
+                return
+            if path == "/v1/videos":
+                self.send_json(200, {"id": "job-{}-{}".format(
+                    model, next(job_seq)),
+                    "object": "video", "status": "queued", "model": model})
+                return
             if path == "/v1/audio/transcriptions":
                 self.send_json(200, {"model": model,
                                      "field": multipart_field(
@@ -570,11 +617,11 @@ def run_cases(binary, tmp_root, ready_dir):
         # busy count and let the queued load proceed long before the held
         # stream's natural end (~12 s). A leaked busy count would keep this
         # request queued past the join deadline or past the other stream.
-        # Closing the connection (not the raw socket) also releases the
-        # buffered response file that keeps the fd referenced, so the FIN
-        # actually leaves the client. conn.sock.close() would only mark the
-        # socket closed while the response reader holds the descriptor.
-        held["a"][0].close()
+        # The relayed stream is close-delimited, so getresponse() already
+        # marked the connection closed and handed the socket to the
+        # response; releasing the response's buffered file is what sends
+        # the FIN (conn.sock.close() could not: getresponse nulled it).
+        held["a"][1].fp.close()
         third.join(timeout=9.0)
         assert not third.is_alive(), \
             ("queued request stuck after client disconnect", router.tail_log())
@@ -583,7 +630,7 @@ def run_cases(binary, tmp_root, ready_dir):
         assert json.loads(payload)["model"] == "dc", payload
         assert queued["elapsed"] < 9.0, queued
         assert router.loaded_map().get("dc") is True
-        held["b"][0].close()
+        held["b"][1].fp.close()
 
     # Case 8: worker that exits right after the health probe: the held
     # request gets 502 upstream_unavailable and the next request reloads.
@@ -610,6 +657,81 @@ def run_cases(binary, tmp_root, ready_dir):
         assert status == 200, (status, payload, router.tail_log())
         assert json.loads(payload)["model"] == "blink", payload
         assert len(router.spawns("blink")) == 2, router.spawns("blink")
+
+    # Case 9: a video job recorded from the worker's create response stays
+    # routable by job id alone (reloading a dead owner) and is released by a
+    # terminal status read or a DELETE.
+    # The fake answers the video endpoints regardless of modality; an llm
+    # section keeps the --served-model-name injection preset.cpp skips for
+    # real video workers.
+    with RouterProcess(binary, tmp_root, "[llm/vee]\nmodel = fake.gguf\n",
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir},
+                       name="video") as router:
+        status, payload = router.request(
+            "POST", "/v1/videos", {"model": "vee", "prompt": "x"})
+        assert status == 200, (status, payload, router.tail_log())
+        created = json.loads(payload)
+        assert created["model"] == "vee", payload
+        job_id = created["id"]
+        assert router.loaded_map().get("vee") is True
+        for pid in router.spawns("vee"):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        assert poll_until(
+            lambda: router.loaded_map().get("vee") is False, 8.0), \
+            ("killed worker still reported loaded", router.tail_log())
+        # Only the recorded job id can resolve this request to its owner.
+        status, payload = router.request("GET", "/v1/videos/" + job_id)
+        assert status == 200, (status, payload, router.tail_log())
+        echoed = json.loads(payload)
+        assert echoed["model"] == "vee", payload
+        assert echoed["id"] == job_id, payload
+        assert len(router.spawns("vee")) == 2, router.spawns("vee")
+        # The worker reports the job completed, so the router forgets it.
+        assert poll_until(
+            lambda: router.request("GET", "/v1/videos/" + job_id)[0] == 404,
+            8.0), ("terminal status did not release the job",
+                   router.tail_log())
+        # A DELETE releases the job the same way.
+        status, payload = router.request(
+            "POST", "/v1/videos", {"model": "vee", "prompt": "y"})
+        job_two = json.loads(payload)["id"]
+        status, payload = router.request("DELETE", "/v1/videos/" + job_two)
+        assert status == 200, (status, payload, router.tail_log())
+        assert poll_until(
+            lambda: router.request("GET", "/v1/videos/" + job_two)[0] == 404,
+            8.0), ("DELETE did not release the job", router.tail_log())
+
+    # Case 10: a live worker that answers /health but closes proxied
+    # connections is killed and unloaded; the next request gets a fresh
+    # worker instead of retrying the same dead backend forever.
+    refuse_dir = os.path.join(tmp_root, "refuse")
+    os.mkdir(refuse_dir)
+    with RouterProcess(binary, tmp_root, "[llm/wuss]\nmodel = fake.gguf\n",
+                       fake_env={"GUFO_FAKE_READY_DIR": ready_dir,
+                                 "GUFO_FAKE_REFUSE_DIR": refuse_dir},
+                       name="refusing") as router:
+        with open(os.path.join(refuse_dir, "wuss.refuse"), "w") as handle:
+            handle.write("1")
+        status, payload = router.request(
+            "POST", "/v1/chat/completions",
+            {"model": "wuss", "messages": []})
+        assert status == 502, (status, payload, router.tail_log())
+        assert json.loads(payload)["error"]["code"] == "upstream_unavailable",\
+            payload
+        dead = router.spawns("wuss")
+        assert dead, router.tail_log()
+        assert poll_until(lambda: all(pid_gone(pid) for pid in dead), 8.0), \
+            ("refusing worker survived the 502", dead, router.tail_log())
+        os.remove(os.path.join(refuse_dir, "wuss.refuse"))
+        status, payload = router.request(
+            "POST", "/v1/chat/completions",
+            {"model": "wuss", "messages": []})
+        assert status == 200, (status, payload, router.tail_log())
+        assert json.loads(payload)["model"] == "wuss", payload
+        assert len(router.spawns("wuss")) == 2, router.spawns("wuss")
 
 
 if __name__ == "__main__":

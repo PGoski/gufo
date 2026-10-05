@@ -270,6 +270,102 @@ private:
   bool armed_{false};
 };
 
+bool IsVideoCreate(const HttpRequest& req) {
+  return req.method == "POST" && req.path == "/v1/videos";
+}
+
+/// Job id of the status resource `/v1/videos/<id>`; empty for `/content` or
+/// any deeper path.
+std::string VideoStatusJobId(const std::string& path) {
+  constexpr std::string_view prefix = "/v1/videos/";
+  if (!path.starts_with(prefix)) {
+    return "";
+  }
+  const std::string_view id(path.data() + prefix.size(),
+                            path.size() - prefix.size());
+  if (id.empty() || id.find('/') != std::string_view::npos) {
+    return "";
+  }
+  return std::string(id);
+}
+
+/// Sniffs a relayed worker body so the router can keep its video-job
+/// bookkeeping aligned with the worker's authoritative response. Bytes
+/// accumulate up to the cap; an oversized or malformed body still relays
+/// untouched and is simply not recorded.
+class VideoBodySniffer {
+public:
+  enum class Kind { kTrack, kStatus, kDelete };
+
+  VideoBodySniffer(std::mutex& mutex, router::Registry& registry, Kind kind,
+                   std::string model_id, std::string job_id)
+      : mutex_(mutex),
+        registry_(registry),
+        kind_(kind),
+        model_id_(std::move(model_id)),
+        job_id_(std::move(job_id)) {}
+  VideoBodySniffer(const VideoBodySniffer&) = delete;
+  VideoBodySniffer& operator=(const VideoBodySniffer&) = delete;
+
+  std::string_view Observe(std::string_view chunk) {
+    if (!discarded_) {
+      if (buffer_.size() + chunk.size() > kBodySniffBytes) {
+        discarded_ = true;
+        buffer_.clear();
+      } else {
+        buffer_.append(chunk);
+      }
+    }
+    return chunk;
+  }
+
+  /// Applies the bookkeeping once the relay has finished (or failed; a
+  /// partial body never parses and records nothing).
+  void Commit() {
+    if (discarded_) {
+      return;
+    }
+    if (kind_ == Kind::kDelete) {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      registry_.CompleteVideoJob(job_id_);
+      return;
+    }
+    json::Value parsed;
+    try {
+      parsed = json::parse(buffer_);
+    } catch (const std::exception&) {
+      return;
+    }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (kind_ == Kind::kTrack) {
+      const auto* id = parsed.find("id");
+      if (id != nullptr && id->is_string() && !id->str().empty()) {
+        registry_.TrackVideoJob(id->str(), model_id_);
+      }
+      return;
+    }
+    const auto* status = parsed.find("status");
+    if (status == nullptr || !status->is_string()) {
+      return;
+    }
+    const std::string value = status->str();
+    if (value == "completed" || value == "failed" || value == "cancelled") {
+      registry_.CompleteVideoJob(job_id_);
+    }
+  }
+
+private:
+  static constexpr std::size_t kBodySniffBytes = 1 << 20;
+
+  std::mutex& mutex_;
+  router::Registry& registry_;
+  Kind kind_;
+  std::string model_id_;
+  std::string job_id_;
+  std::string buffer_;
+  bool discarded_{false};
+};
+
 /// Routes requests, owns live workers and the shared admission state.
 class RouterState {
 public:
@@ -379,27 +475,38 @@ public:
     // runs with the lock free; the busy count keeps the worker resident.
     lock.unlock();
     HttpResponse response = router::ProxyToWorker(target, req);
+    std::shared_ptr<VideoBodySniffer> sniffer;
+    if (response.status >= 200 && response.status < 300 &&
+        response.streaming_body) {
+      sniffer = MakeVideoSniffer(req, model_id);
+    }
     {
       const std::lock_guard<std::mutex> relock(mutex);
       if (response.status == 502 && !response.streaming_body) {
-        ReapIfExitedLocked(model_id);
+        HandleUpstreamFailureLocked(model_id);
       }
     }
     if (response.streaming_body) {
       // The busy count lives until the streamed body completes or cancels.
       HttpResponse streamed = std::move(response);
-      // The front closes after one response, but a stream needs the client
-      // socket open until the last chunk so a disconnect can be observed.
-      streamed.headers.emplace_back("Connection", "keep-alive");
       streamed.streaming_body = [inner = std::move(streamed.streaming_body),
-                                 busy](const HttpResponse::BodyWriter& writer) {
+                                 busy, sniffer](
+                                    const HttpResponse::BodyWriter& writer) {
+        const HttpResponse::BodyWriter sink =
+            sniffer == nullptr ? writer
+                               : [&writer, sniffer](std::string_view chunk) {
+                                   return writer(sniffer->Observe(chunk));
+                                 };
         try {
-          inner(writer);
+          inner(sink);
         } catch (...) {
           busy->Release();
           throw;
         }
         busy->Release();
+        if (sniffer != nullptr) {
+          sniffer->Commit();
+        }
       };
       return streamed;
     }
@@ -520,9 +627,11 @@ private:
     mutex.lock();
   }
 
-  /// Marks the model unloaded only when its worker has actually exited; a
-  /// live-but-refusing worker keeps its state for the next-request retry.
-  void ReapIfExitedLocked(const std::string& id) {
+  /// A 502 relayed before any upstream response byte means the worker failed
+  /// for this request. Reap it when it exited; a live-but-refusing worker is
+  /// killed and unloaded so the next request spawns a fresh backend instead
+  /// of retrying the same dead one until the idle timeout.
+  void HandleUpstreamFailureLocked(const std::string& id) {
     auto worker = FindWorkerLocked(id);
     if (worker == nullptr) {
       return;
@@ -533,7 +642,35 @@ private:
                                  " status=" + std::to_string(exit_status));
       registry.MarkUnloaded(id);
       workers.erase(id);
+      return;
     }
+    Logger::Warn("router",
+                 "event=worker_unresponsive model=" + id + " action=restart");
+    StopLocked(id);
+  }
+
+  /// Video-job bookkeeping for proxied 2xx responses: the create response
+  /// records the worker-assigned id against the owning model; a terminal
+  /// status read or a DELETE releases it. Returns nullptr for non-video
+  /// requests.
+  std::shared_ptr<VideoBodySniffer> MakeVideoSniffer(
+      const HttpRequest& req, const std::string& model_id) {
+    if (IsVideoCreate(req)) {
+      return std::make_shared<VideoBodySniffer>(
+          mutex, registry, VideoBodySniffer::Kind::kTrack, model_id, "");
+    }
+    if (req.method != "GET" && req.method != "DELETE") {
+      return nullptr;
+    }
+    const std::string job_id = VideoStatusJobId(req.path);
+    if (job_id.empty()) {
+      return nullptr;
+    }
+    return std::make_shared<VideoBodySniffer>(
+        mutex, registry,
+        req.method == "DELETE" ? VideoBodySniffer::Kind::kDelete
+                               : VideoBodySniffer::Kind::kStatus,
+        model_id, job_id);
   }
 
   /// Arms a fresh spawn with a freshly reserved port. Returns the fatal 502
