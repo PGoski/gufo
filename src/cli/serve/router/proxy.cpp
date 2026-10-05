@@ -120,6 +120,9 @@ int ConnectTo(const UpstreamTarget& target, std::string* error) {
 bool SendAll(int fd, std::string_view payload) {
   while (!payload.empty()) {
     const auto count = ::send(fd, payload.data(), payload.size(), MSG_NOSIGNAL);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
     if (count <= 0) {
       return false;
     }

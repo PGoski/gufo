@@ -95,10 +95,33 @@ private:
 // Socket I/O helpers
 // ---------------------------------------------------------------------------
 
+/// A blocking socket read or write that returns EINTR was interrupted by a
+/// handler installed without SA_RESTART (the websocket detach interrupt is
+/// one), so resuming is always correct. Failing instead turns a healthy
+/// connection into a spurious 400 or a truncated response.
+ssize_t ReadInterruptible(int fd, void* buf, std::size_t size) {
+  for (;;) {
+    const ssize_t n = ::read(fd, buf, size);
+    if (n < 0 && errno == EINTR)
+      continue;
+    return n;
+  }
+}
+
+ssize_t SendInterruptible(int fd, const void* buf, std::size_t size,
+                          int flags) {
+  for (;;) {
+    const ssize_t n = ::send(fd, buf, size, flags);
+    if (n < 0 && errno == EINTR)
+      continue;
+    return n;
+  }
+}
+
 bool ReadUntil(std::string& out, int fd, std::string_view delim) {
   char buf[4096];
   while (out.find(delim) == std::string::npos) {
-    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    const ssize_t n = ReadInterruptible(fd, buf, sizeof(buf));
     if (n <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(n));
@@ -114,7 +137,7 @@ bool ReadN(std::string& out, int fd, std::size_t n) {
   char buf[4096];
   while (got < n) {
     const std::size_t want = std::min(sizeof(buf), n - got);
-    const ssize_t r = ::read(fd, buf, want);
+    const ssize_t r = ReadInterruptible(fd, buf, want);
     if (r <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(r));
@@ -131,7 +154,8 @@ bool SendAll(int fd, std::string_view data) {
 #else
     const int flags = 0;
 #endif
-    const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, flags);
+    const ssize_t n =
+        SendInterruptible(fd, data.data() + sent, data.size() - sent, flags);
     if (n <= 0)
       return false;
     sent += static_cast<std::size_t>(n);
