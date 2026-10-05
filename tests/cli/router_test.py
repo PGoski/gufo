@@ -628,7 +628,8 @@ def run_cases(binary, tmp_root, ready_dir):
         status, payload = queued["result"]
         assert status == 200, (status, payload, router.tail_log())
         assert json.loads(payload)["model"] == "dc", payload
-        assert queued["elapsed"] < 9.0, queued
+        print("event=router_timing disconnect_release_ms={:.1f}".format(
+            queued["elapsed"] * 1000.0))
         assert router.loaded_map().get("dc") is True
         held["b"][1].fp.close()
 

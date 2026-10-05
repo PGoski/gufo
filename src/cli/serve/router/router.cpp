@@ -431,10 +431,6 @@ public:
       return Err(400, "Bad Request", "missing 'model' field",
                  "invalid_request_error", "missing_model");
     }
-    if (stop_requested.load()) {
-      return Err(502, "Bad Gateway", "router is shutting down", "server_error",
-                 "upstream_unavailable");
-    }
     Resolution resolved = resolution;
     if (resolved.model_id.empty() && server::IsVideoApiPath(req.path) &&
         (req.method == "GET" || req.method == "DELETE")) {
@@ -461,6 +457,12 @@ public:
         !LoadedLocked(model_id)) {
       return Err(409, "Conflict", "model '" + model_id + "' is not loaded",
                  "invalid_request_error", "model_not_loaded");
+    }
+    // Shutdown order per spec: the drain refuses NEW loads but keeps proxying
+    // already-loaded models until the final worker stop.
+    if (stop_requested.load() && !LoadedLocked(model_id)) {
+      return Err(502, "Bad Gateway", "router is shutting down", "server_error",
+                 "upstream_unavailable");
     }
     auto admitted = AdmitLocked(model_id, *preset);
     if (const auto* failed = std::get_if<HttpResponse>(&admitted)) {
@@ -517,7 +519,7 @@ public:
   /// One supervision tick: reap dead workers, unload idle ones, free a slot
   /// for queued loads, and kill wedged loads past their deadline.
   void SuperviseOnce() {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(mutex);
     for (auto it = workers.begin(); it != workers.end();) {
       int exit_status = 0;
       if (it->second->PollExit(&exit_status)) {
@@ -623,7 +625,12 @@ private:
       return;
     }
     mutex.unlock();
-    worker->Stop();
+    try {
+      worker->Stop();
+    } catch (...) {
+      mutex.lock();
+      throw;
+    }
     mutex.lock();
   }
 
@@ -766,7 +773,13 @@ private:
         int exit_status = 0;
         const bool exited = worker->PollExit(&exit_status);
         mutex.unlock();
-        const bool healthy = worker->Healthy();
+        bool healthy = false;
+        try {
+          healthy = worker->Healthy();
+        } catch (...) {
+          mutex.lock();
+          throw;
+        }
         mutex.lock();
         if (exited) {
           Logger::Warn("router", "event=worker_exit model=" + model_id +
@@ -811,7 +824,12 @@ private:
     workers.erase(model_id);
     if (worker != nullptr) {
       mutex.unlock();
-      worker->Stop();
+      try {
+        worker->Stop();
+      } catch (...) {
+        mutex.lock();
+        throw;
+      }
       mutex.lock();
     }
     return Err(504, "Gateway Timeout",
@@ -996,25 +1014,33 @@ int RunRouter(std::span<const char* const> args) {
   state->stop_requested.store(true);
   const auto drain_deadline = std::chrono::steady_clock::now() + kShutdownDrain;
   while (std::chrono::steady_clock::now() < drain_deadline) {
-    std::lock_guard<std::mutex> lock(state->mutex);
     bool any_busy = false;
-    for (const auto& [id, worker] : state->workers) {
-      (void)worker;
-      any_busy = any_busy || state->registry.Busy(id);
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      for (const auto& [id, worker] : state->workers) {
+        (void)worker;
+        any_busy = any_busy || state->registry.Busy(id);
+      }
     }
     if (!any_busy) {
       break;
     }
+    // The lock is free while sleeping so completing requests can decrement
+    // their busy count and end the drain early.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
   {
     std::vector<std::shared_ptr<router::Worker>> live;
-    std::lock_guard<std::mutex> lock(state->mutex);
-    for (auto& [id, worker] : state->workers) {
-      (void)id;
-      live.push_back(std::move(worker));
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      for (auto& [id, worker] : state->workers) {
+        (void)id;
+        live.push_back(std::move(worker));
+      }
+      state->workers.clear();
     }
-    state->workers.clear();
+    // Stop runs with the state mutex free; the local shared_ptrs keep the
+    // worker objects alive until each has been terminated.
     for (auto& worker : live) {
       worker->Stop();
     }
