@@ -12,7 +12,9 @@ set(gufo_pr_targets
   qwen3_asr_config_test qwen3_asr_audio_api_test
   qwen3_tts_config_test qwen3_tts_audio_api_test
   qwen_image_21_test
-  video_api_test minimax_h3_sampling_test minimax_h3_runtime_test)
+  video_api_test minimax_h3_sampling_test minimax_h3_runtime_test
+  router_preset_test router_registry_test router_proxy_test router_workers_test
+  router_ws_relay_test)
 set(gufo_pr_tests ${gufo_pr_targets})
 list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
@@ -20,7 +22,8 @@ list(REMOVE_ITEM gufo_pr_tests
 list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
-  gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test)
+  gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test
+  gufo_router_help router_contract_test)
 list(JOIN gufo_pr_tests "|" gufo_pr_pattern)
 add_custom_target(check-pr
   COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure --no-tests=error
