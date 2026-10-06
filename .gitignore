@@ -124,3 +124,4 @@ tests/quality/compsec.json
 # Local worktrees and SDD scratch
 .worktrees/
 .superpowers/
+dist/

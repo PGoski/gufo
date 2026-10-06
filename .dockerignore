@@ -1,0 +1,7 @@
+build/
+dist/
+.worktrees/
+obsidian-vault/
+.DS_Store
+}
+.superpowers/
