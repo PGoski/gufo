@@ -121,6 +121,10 @@ EOS or the context is full. `--context N` sets context capacity per session;
 `--max-tokens N` sets a default response limit that clients can override.
 Reasoning tokens count toward that response limit.
 
+- `gufo router` multiplexes several preset models (text, image, video, TTS,
+  ASR) behind one OpenAI-compatible front, starting and unloading
+  `gufo serve` workers on demand; see the [model router](docs/SERVER.md#model-router).
+
 ## Build from source
 
 Linux x86-64 on AMD Strix Halo (`gfx1151`) is the supported target. CMake owns

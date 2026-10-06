@@ -45,6 +45,7 @@ The executable provides subcommands rather than separate inference binaries:
 
 ```text
 gufo serve
+gufo router
 gufo chat
 gufo prompt
 gufo video
@@ -348,6 +349,136 @@ HTTP workers submit requests through `TextGenerationBackend`. The text
 scheduler owns request state and serializes model execution. Model runners own
 weights, tokenization, prefill/decode, speculative verification and complete
 cache snapshots. HTTP handlers do not implement model kernels.
+
+## Model router
+
+`gufo router` exposes one OpenAI-compatible front door for several preset
+models across the five `serve` modalities. It spawns `gufo serve
+<modality>` workers on loopback on demand, reverse-proxies HTTP, SSE,
+WebSocket and multipart traffic to them, and unloads workers that have
+been idle or are displaced by `--models-max`.
+
+```text
+gufo router --models-preset <FILE>
+            [--models-dir <DIR>]
+            [--models-max N]            default 2; 0 = unlimited
+            [--sleep-idle-seconds SEC]  default 900; 0 disables idle unload
+            [--load-timeout-seconds S]  default 600; 0 = unlimited wait
+            [--autoload]                preload preset models at startup
+            [--host IP] [--port N] [--api-key KEY]
+            [--max-connections N] [--max-request-bytes N]
+            [--log-level LEVEL] [-v]
+```
+
+Front server options use the same names and defaults as `serve`, including
+the `HOST`, `PORT`, `GUFO_HOST` and `GUFO_PORT` environment fallbacks. The
+router injects `GUFO_HOST=127.0.0.1` and a reserved loopback `GUFO_PORT`
+into every child, so workers bind loopback and run keyless; the front
+enforces `--api-key` and never forwards a client `Authorization` header.
+`gufo router help` prints the preset grammar plus, per modality, the
+accepted keys generated from the same option registrations that render
+`gufo serve <modality> --help`.
+
+### Preset file
+
+Plain UTF-8 text. Full-line `#` comments and blank lines are ignored; a
+value runs to the end of the line (no inline comments, no escapes).
+Each model is one section:
+
+```ini
+# Full-line comments only (leading '#'). Blank lines ignored.
+
+[llm/qwen3.8-27b]
+model        = /models/llm/Qwen3.8-27B-UD-Q4_K_XL.gguf
+speculative  = dflash2
+dflash-model = /models/llm/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+sessions     = 2
+cache-disk   = /var/cache/gufo/qwen27b
+
+[asr/qwen3-asr]
+model = /models/qwen3-asr
+```
+
+- The section header is `[<modality>/<model-id>]` with modality in
+  `llm|image|video|tts|asr`. `model-id` is the routing key, must be unique
+  across the file, and becomes the worker's `--served-model-name` default
+  except for `video`, whose server has no such option.
+- A body line `key = value` maps to worker argv `--key value` verbatim.
+  Boolean flags use `key = true|false`: `true` passes the bare flag,
+  `false` omits it. Keys are validated against that modality's registered
+  long options only, so a new `gufo serve` option becomes available in the
+  preset file without any router change.
+- `host`, `port` and `api-key` are router-managed and rejected in
+  sections.
+- Relative path values resolve against `--models-dir`, or against the
+  router's working directory when it is unset.
+- Startup validation feeds every section through the modality's real
+  argument parser; unknown keys, bad values, empty bodies and duplicate
+  ids abort with the same message `gufo serve <modality>` would print,
+  prefixed with the section name. `--models-max` must be `0` or at least
+  `1`; with `--autoload`, presets beyond the limit are not an error: the
+  first `--models-max` sections preload in section order and the rest load
+  on demand.
+
+### Routing and proxying
+
+| Endpoint | Model source |
+| --- | --- |
+| `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/images/*`, `/v1/audio/speech`, `/v1/videos` | JSON `model` field |
+| `/v1/audio/transcriptions` (multipart) | `model` form field |
+| `/v1/realtime`, `/v1/audio/speech/stream` (WebSocket) | `model` query parameter |
+| `/v1/videos/<id>` status/content | router job table |
+
+A missing model field or query parameter returns 400
+`invalid_request_error` naming the missing field; an unknown model id
+returns 404 `model_not_found` listing the preset ids. The front answers
+`GET /health` and `GET /ready` (with the `/healthz`, `/readyz` and
+`/v1/...` aliases) once preset validation passed and the listener is up,
+independent of workers. `GET /v1/models` lists every preset model in
+OpenAI list shape with the extension field `"loaded": true|false`.
+`GET /v1/slots` and `GET /v1/metrics` require `?model=<id>`: they proxy to
+that worker when loaded and return 409 `model_not_loaded` otherwise.
+Unknown paths return 404 `not_found`, and video routes keep `serve`'s verb
+and job-id precedence (405 `method_not_allowed`, 404 `video_not_found`).
+
+Response bodies relay without re-serialization: SSE bytes pass through
+verbatim, WebSocket upgrades complete against the worker and frames relay
+in both directions until either side closes, and multipart bodies stream
+to the worker under the front's `--max-request-bytes` bound. Closing the
+front connection closes the worker connection, propagating cancellation.
+Video job ids returned by `POST /v1/videos` are recorded with their
+model: while a tracked job is non-terminal its worker is exempt from
+eviction and idle unload, and a status or content read for a recorded job
+reloads that worker if it died, answering from the persisted `--root`
+job state.
+
+### Lifecycle
+
+A worker spawns on the first request for its model; requests for the same
+model queue behind readiness, which is the worker's `/health` answering
+200 (503 means still loading). A worker becomes unloadable
+`--sleep-idle-seconds` after its last activity, measured from both
+request start and request end, including full SSE streams and open
+WebSocket sessions; unload is SIGTERM followed by SIGKILL after a 10
+second grace. At `--models-max` the least-recently-active unloadable
+worker is evicted for a new load; when every worker is busy, the
+new-model request waits in a FIFO queue for the next freed slot instead
+of being refused. Workers set `PR_SET_PDEATHSIG`, so they die with the
+router even after an unclean exit.
+
+| Condition | Behavior |
+| --- | --- |
+| Bad preset (unknown key, bad value, duplicate id, reserved key) | Startup abort, exit 2, section-prefixed parser message |
+| Worker load fails (non-zero exit) | Held requests 502 `upstream_unavailable`, model unloaded, next request retries |
+| Worker dies mid-request | Streams close as with today's `serve` crash; model unloaded |
+| `--models-max` reached, nothing unloadable | New-model requests queued FIFO for the next freed slot |
+| Cold load (queue + spawn + readiness) exceeds `--load-timeout-seconds` | Held and queued requests 504 `load_timeout`, worker killed, model unloaded, next request retries |
+| Idle timeout / eviction | Drain-then-kill; no in-flight request is ever cut |
+| GPU `device_lost` in a worker | Existing worker exit path; the router treats it as death |
+
+On `SIGINT`/`SIGTERM` the front stops accepting, refuses new loads, keeps
+proxying loaded models while in-flight work drains for up to 10 seconds,
+then terminates every worker and exits 0.
 
 ## Endpoint Set
 

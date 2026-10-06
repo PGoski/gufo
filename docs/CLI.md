@@ -196,6 +196,7 @@ These apply to every modality, before or after the subcommand:
 
 ```text
 gufo serve
+gufo router
 gufo chat
 gufo prompt
 gufo eval
@@ -205,7 +206,8 @@ gufo transcribe
 gufo diagnose
 ```
 
-`serve` starts the OpenAI-compatible server. `chat` maintains an interactive
+`serve` starts the OpenAI-compatible server. `router` multiplexes several
+preset models behind one server front. `chat` maintains an interactive
 conversation. `prompt` executes one request and exits. `eval` grades the pinned
 DS4 capability questions through an already running OpenAI-compatible server.
 `bench` measures model execution, `video` runs MiniMax H3 generation,
@@ -237,6 +239,40 @@ gufo serve --help
 # or
 gufo serve llm --help
 ```
+
+### Model router
+
+`gufo router` serves several preset models through one OpenAI-compatible
+front, starting `gufo serve <modality>` workers on demand and unloading them
+when they idle or are displaced. The preset file format is documented in the
+[model router section of SERVER.md](SERVER.md#model-router).
+
+```sh
+gufo router --models-preset models.ini --models-max 2
+```
+
+- `models-preset` — preset file listing the models to multiplex. Required.
+- `models-dir` — base directory that resolves relative model paths in
+  sections. Default: the router's working directory.
+- `models-max` — maximum concurrently loaded workers. Default: 2; `0` means
+  unlimited.
+- `sleep-idle-seconds` — unload a worker idle for this long (measured from
+  request start and request end, including streams and open WebSockets).
+  Default: 900; `0` disables idle unload.
+- `load-timeout-seconds` — bound for one full cold load (admission queue,
+  spawn and readiness). Default: 600; `0` means unlimited.
+- `autoload` — preload preset models at startup in section order, up to
+  `--models-max`; the rest still load on demand. Default: off.
+-   Shared server options apply to the front: `host` / `port` (`-i` / `-p`,
+  defaults `127.0.0.1:8080`, with `HOST` / `PORT` taking precedence over
+  `GUFO_HOST` / `GUFO_PORT`), `maxConnections` (default 16), `maxRequestBytes` (default
+  8388608), `apiKey` (default unset), `logLevel` (default `info`) and
+  `verbose` (`-v`). The router does not accept `--sessions`; each worker
+  takes its own.
+
+`gufo router --help` also prints the preset grammar and every key accepted
+per modality, generated from the same registrations as `gufo serve
+<modality> --help`.
 
 ### Diagnose
 
