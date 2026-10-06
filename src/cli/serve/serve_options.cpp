@@ -240,7 +240,8 @@ void RegisterLlmServeOptions(ArgParser& parser, LlmServeOptions* options) {
       "Scheduling", &options->max_buffered_output_bytes_total);
   parser.AddOption(
       "", "--cache-ram-bytes", "N",
-      "Retained RAM-cache byte budget (default: 0 = auto, at most 32 GiB)",
+      "Retained RAM-cache byte budget (default: 0 = auto: half of free "
+      "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB)",
       "Cache", &options->cache_ram_bytes);
   parser.AddOption("", "--cache-disk", "DIR",
                    "Opt-in restart-safe continuation cache directory", "Cache",

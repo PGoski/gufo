@@ -112,9 +112,10 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-For Open WebUI, VS Code and OpenAI SDK clients, set the API base URL to
-`http://localhost:8080/v1`. Chat Completions supports text, images, tools and
-streaming; Responses supports text and streaming. See the [API contract](docs/SERVER.md).
+For Open WebUI, VS Code, OpenAI SDK and Responses-API clients (for example
+Codex), set the API base URL to `http://localhost:8080/v1`. Chat Completions and
+Responses support text, images, function tools, structured output and streaming.
+See the [API contract](docs/SERVER.md).
 
 The text server uses the model's native context by default and generates until
 EOS or the context is full. `--context N` sets context capacity per session;
@@ -124,6 +125,14 @@ Reasoning tokens count toward that response limit.
 - `gufo router` multiplexes several preset models (text, image, video, TTS,
   ASR) behind one OpenAI-compatible front, starting and unloading
   `gufo serve` workers on demand; see the [model router](docs/SERVER.md#model-router).
+
+## Harness notes
+
+- **Qwen with Codex:** Codex sends developer messages mid-conversation, after
+  compaction or a settings change. Qwen's template accepts only one leading
+  system turn, so Gufo moves them there. The request that introduces one is
+  prefilled again; later requests reuse the cache. See the
+  [API contract](docs/SERVER.md).
 
 ## Build from source
 

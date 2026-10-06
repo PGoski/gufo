@@ -31,7 +31,9 @@ void RequireExact(std::span<const float> expected,
           message);
 }
 
-void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model) {
+void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model,
+                                     bool warm_storage,
+                                     bool protect_rows = false) {
   std::string error;
   const auto mode = gufo::core::SessionMode::kAutoregressive;
   auto decoding = model->CreateSession(mode, 128, &error);
@@ -41,8 +43,20 @@ void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model) {
   const auto prompt = model->Tokenize("Continue: red, blue, red, blue,");
   for (auto* session : {decoding.get(), reference.get(), frozen.get()})
     Require(session->Sync(prompt, &error), error);
-  const auto expected_snapshot = frozen->SaveSnapshot(&error);
+  auto expected_snapshot =
+      (warm_storage ? frozen : reference)->SaveSnapshot(&error);
   Require(expected_snapshot != nullptr, error);
+  std::unique_ptr<qfn::SessionSnapshot> prefix_checkpoint;
+  if (protect_rows) {
+    prefix_checkpoint = frozen->SaveSnapshot(&error);
+    Require(prefix_checkpoint != nullptr, error);
+    auto extended = prompt;
+    extended.push_back(prompt.front());
+    Require(frozen->Sync(extended, &error), error);
+    expected_snapshot =
+        frozen->SaveSnapshot(&error, qfn::Session::SnapshotMode::kMaterialized);
+    Require(expected_snapshot != nullptr, error);
+  }
 
   // Warm the one-token shape; its next execution records the decode graph.
   Require(decoding->Evaluate(prompt.front(), &error) &&
@@ -53,15 +67,26 @@ void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model) {
   unsigned checkpoints = 0;
   decoding->SetCancellationCheck([&] {
     // Forward checks once before capture and again at its first layer.
-    if (++checkpoints == 2)
-      concurrent_snapshot = std::async(std::launch::async, [&] {
-                              return frozen->SaveSnapshot(&snapshot_error);
-                            }).get();
+    if (++checkpoints == 2) {
+      try {
+        concurrent_snapshot = std::async(std::launch::async, [&] {
+                                return frozen->SaveSnapshot(&snapshot_error);
+                              }).get();
+      } catch (const std::exception& e) {
+        snapshot_error = e.what();
+        throw;
+      }
+    }
     return false;
   });
-  Require(decoding->Evaluate(prompt.back(), &error), error);
+  const bool evaluated = decoding->Evaluate(prompt.back(), &error);
+  Require(evaluated, error + "; peer snapshot: " + snapshot_error);
   decoding->SetCancellationCheck({});
   Require(concurrent_snapshot != nullptr, snapshot_error);
+  // Restore shares the executor's stream and follows its completed forward.
+  // The captured checkpoint must preserve its suffix before the rewind.
+  if (prefix_checkpoint)
+    Require(frozen->RestoreSnapshot(*prefix_checkpoint, &error), error);
   Require(concurrent_snapshot->bytes().size() ==
                   expected_snapshot->bytes().size() &&
               std::memcmp(concurrent_snapshot->bytes().data(),
@@ -681,6 +706,97 @@ void CheckExecutionModes(const std::shared_ptr<qfn::Model>& model) {
             << std::flush;
 }
 
+void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
+  namespace server = gufo::server;
+  using Backend = server::InferenceBackend;
+  Backend backend;
+  std::string error;
+  server::TextSpeculativeConfig options;
+  options.backend = server::TextSpeculativeBackend::kMtp;
+  Require(backend.load(model, &error, 128, 2, {}, {}, options), error);
+  // Synthetic grammar pieces make the boundary deterministic: any ordinary
+  // first token completes the empty JSON object; only stop tokens may follow.
+  // Actual token IDs, EOS recognition, GPU execution and checkpoints stay real.
+  auto constraint = std::make_shared<sampling::TokenConstraint>();
+  constraint->grammar = sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{},"additionalProperties":false})"),
+      true);
+  constraint->vocabulary = std::make_shared<sampling::ConstraintVocabulary>(
+      model->VocabSize(), [&](std::uint32_t token) {
+        return sampling::ConstraintVocabulary::Piece{
+            .text = model->IsStopToken(token) ? "" : "{}",
+            .stop = model->IsStopToken(token),
+        };
+      });
+  sampling::SamplingConfig config;
+  config.constraint = std::move(constraint);
+  const std::array<std::string, 2> prompts{
+      "EOS fixture one: continue red, blue,",
+      "EOS fixture two: continue green, yellow,"};
+  std::array<Backend::Result, 2> references;
+  for (std::size_t row = 0; row < prompts.size(); ++row) {
+    references[row] = backend.complete(prompts[row], 8, config);
+    Require(
+        references[row].tokens.size() == 1 &&
+            !model->IsStopToken(references[row].tokens.front()),
+        "scalar MTP executed EOS or trailing work after the forced boundary");
+    const auto replay = backend.complete(prompts[row], 8, config);
+    Require(
+        replay.tokens == references[row].tokens && replay.prefill_tokens == 0,
+        "scalar EOS checkpoint did not replay exactly without prefill");
+  }
+  std::array<std::future<Backend::Result>, 2> pending;
+  std::latch ready(pending.size());
+  for (std::size_t row = 0; row < pending.size(); ++row) {
+    pending[row] = std::async(
+        std::launch::async, [&backend, &ready, &prompts, &config, row] {
+          ready.arrive_and_wait();
+          return backend.complete(prompts[row], 8, config);
+        });
+  }
+  std::size_t batched = 0;
+  for (std::size_t row = 0; row < pending.size(); ++row) {
+    const auto result = pending[row].get();
+    Require(result.tokens == references[row].tokens,
+            "batched EOS accounting differs from the scalar checkpoint");
+    batched += result.physical_execution_width > 1;
+  }
+  Require(batched > 0, "EOS fixture did not exercise batched MTP");
+  // Completions explicitly ignoring EOS must retain their requested budget.
+  const auto ignored_request =
+      backend.start_complete(prompts.front(), 8, config, {}, false, true);
+  const auto ignored = ignored_request->Wait({}, {});
+  Require(
+      ignored.tokens.size() == 8 &&
+          std::all_of(ignored.tokens.begin() + 1, ignored.tokens.end(),
+                      [&](auto token) { return model->IsStopToken(token); }),
+      "MTP ignored the request's explicit ignore_eos policy");
+  std::latch mixed_ready(pending.size());
+  for (std::size_t row = 0; row < pending.size(); ++row) {
+    pending[row] = std::async(
+        std::launch::async, [&backend, &mixed_ready, &prompts, &config, row] {
+          mixed_ready.arrive_and_wait();
+          const auto request = backend.start_complete(prompts[row], 8, config,
+                                                      {}, false, row == 1);
+          return request->Wait({}, {});
+        });
+  }
+  const auto stopped = pending[0].get();
+  const auto continuing = pending[1].get();
+  Require(
+      stopped.tokens == references[0].tokens && continuing.tokens.size() == 8 &&
+          std::all_of(continuing.tokens.begin() + 1, continuing.tokens.end(),
+                      [&](auto token) { return model->IsStopToken(token); }) &&
+          (stopped.physical_execution_width > 1 ||
+           continuing.physical_execution_width > 1),
+      "mixed MTP batch did not respect each row's EOS policy");
+  std::cout << "serving_eos scalar_and_batch_exact=1 checkpoint_replay=1 "
+               "ignore_eos_budget=8 batched_requests="
+            << batched << '\n'
+            << std::flush;
+}
+
 void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   namespace server = gufo::server;
   using Backend = server::InferenceBackend;
@@ -831,13 +947,14 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--sampling-only";
   const bool cache_only =
       argc == 6 && std::string_view(argv[5]) == "--cache-only";
+  const bool eos_only = argc == 6 && std::string_view(argv[5]) == "--eos-only";
   if ((argc != 5 && !batch_only && !prefill_only && !sampling_only &&
-       !cache_only) ||
+       !cache_only && !eos_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr
-        << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
-           "[--batch-only | --prefill-only | --sampling-only | --cache-only]\n";
+    std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
+                 "[--batch-only | --prefill-only | --sampling-only | "
+                 "--cache-only | --eos-only]\n";
     return 77;
   }
   try {
@@ -847,13 +964,20 @@ int main(int argc, char** argv) {
         {.max_context = 6145, .mtp_model_path = argv[4], .max_draft_tokens = 7},
         &error);
     Require(model != nullptr, error);
+    if (eos_only) {
+      CheckServingEos(model);
+      return 0;
+    }
     if (cache_only) {
       CheckMtpCacheReplay(model);
       return 0;
     }
-    CheckSnapshotDuringGraphCapture(model);
+    CheckSnapshotDuringGraphCapture(model, false);
+    CheckSnapshotDuringGraphCapture(model, true);
+    CheckSnapshotDuringGraphCapture(model, true, true);
     CheckExecutionModes(model);
     if (sampling_only) {
+      CheckServingEos(model);
       CheckServingSampling(model);
       return 0;
     }
@@ -870,6 +994,7 @@ int main(int argc, char** argv) {
     CheckBatchedSessions(model);
     if (batch_only)
       return 0;
+    CheckServingEos(model);
     const auto pattern = model->Tokenize(
         "The quick brown fox jumps over the lazy dog. "
         "Strix Halo executes this deterministic benchmark sequence. ");
