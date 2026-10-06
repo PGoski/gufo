@@ -7,7 +7,7 @@
 #
 # Requires network access to cache.nixos.org and roughly 25 GB of free disk.
 
-FROM nixos/nix:latest AS build
+FROM --platform=linux/amd64 nixos/nix:latest AS build
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 WORKDIR /src
 COPY . .
@@ -18,7 +18,7 @@ RUN nix build -L --option sandbox false .#release \
  && echo "$(realpath ./result)/bin/gufo" > /export/GUFO_PATH \
  && echo "$(realpath ./result)/bin/gufo-server" > /export/GUFO_SERVER_PATH
 
-FROM debian:bookworm-slim AS runtime
+FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*

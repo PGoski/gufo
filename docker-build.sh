@@ -12,6 +12,10 @@ REV="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 IMAGE="${IMAGE_NAME}:${REV}"
 
 command -v "$DOCKER" >/dev/null || { echo "docker not found (set DOCKER=...)" >&2; exit 1; }
+if [ "$(uname -m)" != "x86_64" ]; then
+  echo "WARNING: host is $(uname -m); Gufo is x86_64-only and this build needs" >&2
+  echo "linux/amd64 emulation (qemu) unless run on an AMD Strix Halo machine." >&2
+fi
 
 echo "==> Building production image ${IMAGE} via nix build .#release"
 "$DOCKER" build -f "$ROOT/.devops/docker/Dockerfile" -t "$IMAGE" "$ROOT"
