@@ -18,7 +18,7 @@ if [ "$(uname -m)" != "x86_64" ]; then
 fi
 
 echo "==> Building production image ${IMAGE} via nix build .#release"
-"$DOCKER" build -f "$ROOT/.devops/docker/Dockerfile" -t "$IMAGE" "$ROOT"
+"$DOCKER" build --platform linux/amd64 -f "$ROOT/.devops/docker/Dockerfile" -t "$IMAGE" "$ROOT"
 
 echo "==> Extracting binaries to dist/"
 mkdir -p "$ROOT/dist"

@@ -3,22 +3,23 @@
 # so the compiler and ROCm versions match the qualified toolchain exactly.
 #
 # Run from the repository root (or use ./docker-build.sh):
-#   docker build -f .devops/docker/Dockerfile -t gufo:latest .
+#   docker build --platform linux/amd64 -f .devops/docker/Dockerfile -t gufo:latest .
 #
 # Requires network access to cache.nixos.org and roughly 25 GB of free disk.
 
-FROM --platform=linux/amd64 nixos/nix:latest AS build
+FROM nixos/nix:latest AS build
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
 WORKDIR /src
 COPY . .
-RUN nix build -L --option sandbox false .#release \
- && mkdir -p /export \
+RUN nix build -L --option sandbox false .#release
+RUN mkdir -p /export \
+ && nix path-info ./result > /tmp/result-path \
  && nix path-info -r ./result > /tmp/runtime-closure \
- && tar -cf - -C / $(sed 's|^/||' /tmp/runtime-closure) | tar -xf - -C /export \
- && echo "$(realpath ./result)/bin/gufo" > /export/GUFO_PATH \
- && echo "$(realpath ./result)/bin/gufo-server" > /export/GUFO_SERVER_PATH
+ && tar -cf - -T /tmp/runtime-closure | tar -xf - -C /export \
+ && echo "$(cat /tmp/result-path)/bin/gufo" > /export/GUFO_PATH \
+ && echo "$(cat /tmp/result-path)/bin/gufo-server" > /export/GUFO_SERVER_PATH
 
-FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
