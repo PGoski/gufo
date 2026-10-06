@@ -1,8 +1,8 @@
 """Process-level contract tests for `gufo router` with scripted fake workers.
 
 Run through ctest as router_contract_test with the gufo binary as argv[1].
-The fake worker reuses this module through the GUFO_ROUTER_WORKER_EXE seam
-(Task 5): a launcher script with this interpreter's shebang imports
+The fake worker reuses this module through the GUFO_ROUTER_WORKER_EXE seam:
+a launcher script with this interpreter's shebang imports
 serve_fake_worker() from tests/cli/router_test.py.
 
 Timings are recorded and printed (event=router_timing), never asserted

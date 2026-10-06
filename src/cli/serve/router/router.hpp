@@ -6,8 +6,8 @@
 namespace gufo::cli {
 
 /// `gufo router`: validate a preset file, optionally preload workers, and
-/// serve health, readiness and model listing on one listener. Request
-/// relaying and admission arrive with the follow-up tasks.
+/// front the preset models on one listener with request relaying, held
+/// loads, admission, websocket relay and worker supervision.
 int RunRouter(std::span<const char* const> args);
 
 }  // namespace gufo::cli
