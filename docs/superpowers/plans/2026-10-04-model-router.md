@@ -1,6 +1,6 @@
 # Model Router Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Add a `gufo router` top-level subcommand that serves multiple preset models across modalities through one OpenAI/Anthropic-compatible front door, spawning `gufo serve` workers on demand with `--models-max` admission, idle unload, and a bounded cold-load timeout.
 
@@ -85,7 +85,7 @@ void RegisterLlmServeOptions(ArgParser&, LlmServeOptions*);
 
 `RegisterXServeOptions` bodies are the current `AddOption`/`AddFlag`/`AddCustomOption` calls moved verbatim, in the exact current order, so help layout and group ordering cannot drift. Caller-side defaults that depend on context (`--context 4096|1024` for speech, `--manifest DefaultH3SourceManifest()`, `--root video-jobs`) stay at the call site: the caller sets struct fields before registering, and `ValidateServeArgv` sets the same context defaults.
 
-- [ ] **Step 1: Capture baseline help text for all five modalities**
+- [x] **Step 1: Capture baseline help text for all five modalities**
 
 Build the current tree, then save the exact help bytes:
 
@@ -98,15 +98,15 @@ done
 
 Expected: five non-empty files.
 
-- [ ] **Step 2: Move the registration code**
+- [x] **Step 2: Move the registration code**
 
 Create `serve_options.{hpp,cpp}` with the declarations above and the moved bodies. Keep every description string, value hint, group name, short flag, and registration order byte-identical. `DefaultH3SourceManifest()` is not moved with the struct default — `RegisterVideoServeOptions` registers `--manifest` with whatever value `options->manifest` holds at call time, as today.
 
-- [ ] **Step 3: Rewire `serve.cpp` to call the shared functions**
+- [x] **Step 3: Rewire `serve.cpp` to call the shared functions**
 
 `PrintServeHelp` builds a default-populated options struct per modality (mirroring today's local defaults), calls `RegisterXServeOptions`, then `AddServerOptionsForHelp`, then `PrintHelp`. Each `RunServe` branch replaces its inline registration with the same call on its existing locals grouped in the struct, reading struct fields afterwards. Delete the moved code and the now-duplicated help registrations.
 
-- [ ] **Step 4: Verify help is byte-identical and parse behavior unchanged**
+- [x] **Step 4: Verify help is byte-identical and parse behavior unchanged**
 
 ```sh
 cmake --build --preset cpu-test --target gufo --parallel 4
@@ -118,7 +118,7 @@ ctest --test-dir build/cpu-test -R 'serve_cli_test|gufo_serve_asr_help|gufo_serv
 
 Expected: every `diff` empty, every test PASS.
 
-- [ ] **Step 5: Add a unit test pinning `ValidateServeArgv`**
+- [x] **Step 5: Add a unit test pinning `ValidateServeArgv`**
 
 In `tests/cli/arg_parser_test.cpp` (or a new `serve_options_test.cpp` registered in `CMakeLists.txt` like `arg_parser_test`, linking `gufo_http`), assert:
 
@@ -136,7 +136,7 @@ assert(ValidateServeArgv("video", {}).find("--model") != std::string::npos);
 
 Run: `cmake --build --preset cpu-test --target serve_options_test && ctest --test-dir build/cpu-test -R '^serve_options_test$' --output-on-failure`. Expected: PASS.
 
-- [ ] **Step 6: Format check and commit**
+- [x] **Step 6: Format check and commit**
 
 ```sh
 nix shell --inputs-from . nixpkgs#clang-tools -c python3 tools/ci/check-format.py
@@ -179,7 +179,7 @@ struct PresetModel {
 
 Grammar (from the spec): full-line `#` comments; blank lines ignored; header `[<modality>/<id>]`; body `key = value`, value runs to end of line (no inline comments); `key = true` → bare `--key` appended, `key = false` → omitted, any other value on a flag-like key is an error from `ValidateServeArgv`; normal keys → `--key`, `value`. Strip a UTF-8 BOM and `\r` line endings; trim spaces around key and around the value's leading edge (a value keeps interior and trailing text as-is). Reject: unknown modality, duplicate `id` across sections, empty section body, reserved keys (`host`, `port`, `api-key` — `IsReservedKey` compares the bare key name), and anything `ValidateServeArgv` rejects for that modality. If the section has no `served-model-name`, append `--served-model-name <id>` to `argv`.
 
-- [ ] **Step 1: Write the failing unit test**
+- [x] **Step 1: Write the failing unit test**
 
 `tests/cli/router_preset_test.cpp` writes preset fixtures to `std::filesystem::temp_directory_path()` and asserts:
 
@@ -197,19 +197,19 @@ Grammar (from the spec): full-line `#` comments; blank lines ignored; header `[<
 // models_dir empty → relative value passed through unchanged.
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 `cmake --build --preset cpu-test --target router_preset_test` → compile error (header missing). That is the failure.
 
-- [ ] **Step 3: Implement `preset.cpp`**
+- [x] **Step 3: Implement `preset.cpp`**
 
 Line loop building the section list; per section run the grammar above then `ValidateServeArgv(modality, argv)` and prefix any returned message with `"[<modality>/<id>] "`.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 `cmake --build --preset cpu-test --target router_preset_test && ctest --test-dir build/cpu-test -R '^router_preset_test$' --output-on-failure` → PASS.
 
-- [ ] **Step 5: Format, commit**
+- [x] **Step 5: Format, commit**
 
 ```sh
 git add src/cli/serve/router/preset.hpp src/cli/serve/router/preset.cpp tests/cli/router_preset_test.cpp CMakeLists.txt
@@ -281,7 +281,7 @@ public:
 
 Semantics (from the spec): a model is unloadable only when not `Busy` (in-flight HTTP request counted from request start to stream end, open WebSocket, or unfinished tracked video job). `EvictionCandidate` picks the least-recently-active unloadable model among ready+loading; video-job owners are never candidates. The idle timer starts at the later of last request start and last request end (`RequestFinished`/`WebSocketClosed`). `RequestLoad` decision per call: ready → `kAwaitLoad` (already satisfied; the caller's poll loop proceeds once state is ready); loading → `kAwaitLoad`; unloaded with a free slot → `kSpawn`, and the caller must `MarkLoading` before spawning; unloaded with all slots used → `kQueue` until the supervision thread evicts (via `EvictionCandidate`) and frees a slot, then `kSpawn`; past the deadline armed on the first `RequestLoad` for that id → `kLoadTimeout`, and the entry is cleared by `MarkUnloaded`. The deadline covers queue plus spawn plus readiness together (spec `--load-timeout-seconds`); `DueLoadTimeouts()` reports still-loading ids past deadline so the supervisor can kill a wedged worker.
 
-- [ ] **Step 1: Write the failing unit tests**
+- [x] **Step 1: Write the failing unit tests**
 
 `tests/cli/router_registry_test.cpp` with a `std::shared_ptr<Clock::time_point>` fake clock, covering:
 
@@ -304,10 +304,10 @@ Semantics (from the spec): a model is unloadable only when not `Busy` (in-flight
 // 7. JobOwner round-trip: TrackVideoJob/CompleteVideoJob/JobOwner("").
 ```
 
-- [ ] **Step 2: Run to verify failure** — build target fails (missing symbols). Expected.
-- [ ] **Step 3: Implement `registry.cpp`** — one entry per preset: state enum, busy counter, last-active timestamp, queue/deadline flags; `JobOwner` a `std::map<std::string, std::string>`.
-- [ ] **Step 4: Run to verify pass** — `ctest --test-dir build/cpu-test -R '^router_registry_test$' --output-on-failure` → PASS.
-- [ ] **Step 5: Format, commit**
+- [x] **Step 2: Run to verify failure** — build target fails (missing symbols). Expected.
+- [x] **Step 3: Implement `registry.cpp`** — one entry per preset: state enum, busy counter, last-active timestamp, queue/deadline flags; `JobOwner` a `std::map<std::string, std::string>`.
+- [x] **Step 4: Run to verify pass** — `ctest --test-dir build/cpu-test -R '^router_registry_test$' --output-on-failure` → PASS.
+- [x] **Step 5: Format, commit**
 
 ```sh
 git add src/cli/serve/router/registry.hpp src/cli/serve/router/registry.cpp tests/cli/router_registry_test.cpp CMakeLists.txt
@@ -343,7 +343,7 @@ gufo::server::HttpResponse ProxyToWorker(const UpstreamTarget& target,
 
 Implementation shape: blocking POSIX socket; send request line `METHOD path?query HTTP/1.1`, headers, body; parse status + headers; if `Content-Length` read exactly; if `Transfer-Encoding: chunked` decode chunks; each chunk goes to the `streaming_body` writer (for SSE this preserves event boundaries as they arrive). Worker responses without either framing are read to connection close.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `tests/cli/router_proxy_test.cpp` runs an in-process fake worker on a raw socket thread (pattern copied from `tests/cli/http_server_test.cpp` socket helpers) asserting:
 
@@ -361,10 +361,10 @@ Implementation shape: blocking POSIX socket; send request line `METHOD path?quer
 //   no crash, no exception escaping.
 ```
 
-- [ ] **Step 2: Verify it fails to build** — expected.
-- [ ] **Step 3: Implement `proxy.cpp`.**
-- [ ] **Step 4: Run to verify pass** — `ctest -R '^router_proxy_test$'` PASS.
-- [ ] **Step 5: Format, commit**
+- [x] **Step 2: Verify it fails to build** — expected.
+- [x] **Step 3: Implement `proxy.cpp`.**
+- [x] **Step 4: Run to verify pass** — `ctest -R '^router_proxy_test$'` PASS.
+- [x] **Step 5: Format, commit**
 
 ```sh
 git add src/cli/serve/router/proxy.hpp src/cli/serve/router/proxy.cpp tests/cli/router_proxy_test.cpp CMakeLists.txt
@@ -415,7 +415,7 @@ public:
 int ReserveLoopbackPort(std::string* error);
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```cpp
 // ReserveLoopbackPort returns a port in [1024,65535]; two calls differ.
@@ -437,10 +437,10 @@ int ReserveLoopbackPort(std::string* error);
 //   non-empty, within 500 ms.
 ```
 
-- [ ] **Step 2: Verify it fails** — expected build failure.
-- [ ] **Step 3: Implement `workers.cpp`** — `execv` in the child with a copied `environ` plus `GUFO_HOST=127.0.0.1` and `GUFO_PORT=<port>`; parent sets `PR_SET_PDEATHSIG` before `execv`; two pump threads read pipes with `poll()`, line-buffer, log, EOF-tolerant. Apply the `GUFO_ROUTER_WORKER_EXE` override exactly as described (it is the contract-test seam; document it in the header comment as test-only).
-- [ ] **Step 4: Run to verify pass** — `ctest -R '^router_workers_test$'` PASS.
-- [ ] **Step 5: Format, commit**
+- [x] **Step 2: Verify it fails** — expected build failure.
+- [x] **Step 3: Implement `workers.cpp`** — `execv` in the child with a copied `environ` plus `GUFO_HOST=127.0.0.1` and `GUFO_PORT=<port>`; parent sets `PR_SET_PDEATHSIG` before `execv`; two pump threads read pipes with `poll()`, line-buffer, log, EOF-tolerant. Apply the `GUFO_ROUTER_WORKER_EXE` override exactly as described (it is the contract-test seam; document it in the header comment as test-only).
+- [x] **Step 4: Run to verify pass** — `ctest -R '^router_workers_test$'` PASS.
+- [x] **Step 5: Format, commit**
 
 ```sh
 git add src/cli/serve/router/workers.hpp src/cli/serve/router/workers.cpp tests/cli/router_workers_test.cpp CMakeLists.txt
@@ -470,14 +470,14 @@ bool RelayWebSocket(const UpstreamTarget& target, gufo::server::WebSocket& front
                     std::string* error);
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In-process: a fake worker thread accepts a socket, completes the WS handshake in server role (hash the client key with the same SHA1 helper), and echoes each received frame verbatim. The front side is a `server::WebSocket` constructed over one end of a `socketpair`; the test peer on the other end sends masked client frames exactly as `HttpServer` would deliver them to the `websocket` callback. Assert: a text frame sent by the front peer arrives echoed back; a close frame from the worker ends the relay (return) within 200 ms; a worker that answers the handshake with a wrong `Sec-WebSocket-Accept` makes `RelayWebSocket` return false with a non-empty error and no hang.
 
-- [ ] **Step 2: Verify it fails** — expected build failure.
-- [ ] **Step 3: Implement `ws_relay.cpp`** — `poll()` loop over the two fds, `read`/`write` raw bytes (no frame parsing), symmetric; on `POLLHUP`/error from either side, `front.MarkClosed()` and return true.
-- [ ] **Step 4: Run to verify pass** — `ctest -R '^router_ws_relay_test$'` PASS.
-- [ ] **Step 5: Format, commit**
+- [x] **Step 2: Verify it fails** — expected build failure.
+- [x] **Step 3: Implement `ws_relay.cpp`** — `poll()` loop over the two fds, `read`/`write` raw bytes (no frame parsing), symmetric; on `POLLHUP`/error from either side, `front.MarkClosed()` and return true.
+- [x] **Step 4: Run to verify pass** — `ctest -R '^router_ws_relay_test$'` PASS.
+- [x] **Step 5: Format, commit**
 
 ```sh
 git add src/cli/serve/router/ws_relay.hpp src/cli/serve/router/ws_relay.cpp tests/cli/router_ws_relay_test.cpp CMakeLists.txt
@@ -512,11 +512,11 @@ int RunRouter(std::span<const char* const> args);
 
 `RunRouter` this task: parse router options (`--models-preset` required, `--models-dir`, `--models-max`, `--sleep-idle-seconds`, `--load-timeout-seconds`, `--autoload`, `--host/--port/--api-key/--max-connections/--max-request-bytes/--log-level/-v` via `AddServerOptions`); `LoadPreset` (abort exit 2 with its error); build `Registry`; `--autoload` spawns workers in section order until `--models-max`; front `HttpServer` with `dispatcher` set to a member that answers the router-managed paths only: `GET /health|/healthz|/v1/health` → 200 `{"status":"ok"}`; `GET /ready*` → 200 `{"status":"ready"}` (preset validation runs before the listener starts, so both spec conditions hold whenever the dispatcher answers); `GET /v1/models|/models` → OpenAI list from `Registry::Listing()` with each entry `{"id", "object":"model", "owned_by":"gufo", "loaded": <bool>}`; everything else → 404 `{"error":{...,"code":"not_found"}}` shaped like serve's `Err`. `gufo router help` prints the preset grammar block then `PrintServeHelp("gufo", m)` for all five modalities. SIGINT/SIGTERM → stop accepting, `Stop()` all live workers, exit 0.
 
-- [ ] **Step 1: Add the dispatcher hook with a failing http_server_test case**
+- [x] **Step 1: Add the dispatcher hook with a failing http_server_test case**
 
 In `tests/cli/http_server_test.cpp`: construct `HttpServer` with null backend, `options.dispatcher = [](const HttpRequest& r){ return response with body "dispatched" + r.path; }`; raw-socket GET `/anything` → 200 body `dispatched/anything`; with `api_key` set, missing bearer still 401 before the dispatcher runs. Run `ctest -R '^http_server_test$'` → FAIL (field missing), implement the two-line hook (`if (options_.dispatcher) return options_.dispatcher(req);` after the `IsAuthorized` check; guard `register_routes()` behind `!options_.dispatcher`), rerun → PASS. Also rerun the full existing `http_server_test` to prove no regression for backend servers.
 
-- [ ] **Step 2: Write the failing CLI contract additions**
+- [x] **Step 2: Write the failing CLI contract additions**
 
 Extend `tests/cli/serve_test.py` with (run() helper already present):
 
@@ -532,15 +532,15 @@ check(["router", "--models-preset", bad_file], 2, "[llm/a]")
 
 Run `ctest --test-dir build/cpu-test -R '^serve_cli_test$'` → FAIL.
 
-- [ ] **Step 3: Implement `router.cpp` front + main.cpp wiring**
+- [x] **Step 3: Implement `router.cpp` front + main.cpp wiring**
 
 Add the `router` subcommand to `main.cpp` dispatch and the `Commands:` help block (`  router         Serve multiple preset models with on-demand loading`), plus `gufo help router` topic routing. Use the worker exe override from Task 5 (`/proc/self/exe` default). Front `HttpServer` gets `backend = nullptr` and the dispatcher described above.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 `cmake --build --preset cpu-test --target gufo --parallel 4 && ctest --test-dir build/cpu-test -R '^serve_cli_test$|^gufo_help$|^gufo_router_help$' --output-on-failure` → PASS. Then a live probe: `./build/cpu-test/gufo router --models-preset /tmp/two-sections.preset --port 18081 &` → `curl /health` 200, `curl /v1/models` lists both ids with `"loaded": false` (or true for autoloaded), kill clean.
 
-- [ ] **Step 5: Format, commit**
+- [x] **Step 5: Format, commit**
 
 ```sh
 git add src/cli/serve/http_server.hpp src/cli/serve/http_server.cpp tests/cli/http_server_test.cpp src/cli/serve/router/router.hpp src/cli/serve/router/router.cpp src/cli/main.cpp CMakeLists.txt tests/cli/serve_test.py
@@ -570,7 +570,7 @@ Dispatch resolution inside the router dispatcher:
 
 Admission loop per request (front thread): poll `registry.RequestLoad(id)` every 50 ms: `kAwaitLoad` → poll `worker.Healthy()`; when registry flipped ready, proceed. `kQueue` → keep waiting (supervision thread runs `EvictionCandidate()` + `Worker::Stop()` when `HasQueued()`). `kLoadTimeout` → 504 `{"error":{"type":"server_error","code":"load_timeout"}}`. Spawn path: `MarkLoading`, `Worker::Spawn`, then wait healthy under the same deadline; if the worker reports bind failure (`EADDRINUSE` startup crash or never turns healthy because the port got stolen), respawn with a fresh `ReserveLoopbackPort()` up to 3 attempts before failing 502 + `MarkUnloaded` (spec: retry spawn up to 3 times). `PollExit` during load → 502 + `MarkUnloaded`. Count activity: `RequestStarted` before proxying, `RequestFinished` in a scope guard when the streamed response completes or cancels. A supervision thread (250 ms tick) runs `DueIdleUnloads()` → drain-then-`Stop()`, then `DueLoadTimeouts()` → kill wedged loading workers + `MarkUnloaded`.
 
-- [ ] **Step 1: Write the failing process-level contract test (part 1)**
+- [x] **Step 1: Write the failing process-level contract test (part 1)**
 
 `tests/cli/router_test.py` defines `FakeWorker` — a Python stdlib `http.server.ThreadingHTTPServer` on a reserved port that answers `/health` 200 after `GUFO_FAKE_READY_DELAY` seconds, `/v1/chat/completions` (and siblings) with JSON echoing its id from `argv`, chunked `/v1/chat/completions?stream=true` SSE, and `/v1/slots`. It is used via `GUFO_ROUTER_WORKER_EXE` (Task 5 seam) — the fake ignores `serve <modality>` argv and reads its id from `--served-model-name`. Cases:
 
@@ -591,10 +591,10 @@ Admission loop per request (front thread): poll `registry.RequestLoad(id)` every
 #   upstream_unavailable, reload on next request
 ```
 
-- [ ] **Step 2: Run to verify failure** — `ctest --test-dir build/cpu-test -R '^router_contract_test$'` fails on the first waiting case (dispatcher still 404s).
-- [ ] **Step 3: Implement the dispatch + admission wiring in `router.cpp`** as specified above.
-- [ ] **Step 4: Run to verify pass** — `router_contract_test` PASS; rerun `serve_cli_test`. The test also records wall-clock latency of the cold-start request and the following hot request for the same model and prints both (`event=router_timing cold_ms=... hot_ms=...`) — recorded and retained per AGENTS.md per-request timing rules, never asserted against absolute values.
-- [ ] **Step 5: Format, commit**
+- [x] **Step 2: Run to verify failure** — `ctest --test-dir build/cpu-test -R '^router_contract_test$'` fails on the first waiting case (dispatcher still 404s).
+- [x] **Step 3: Implement the dispatch + admission wiring in `router.cpp`** as specified above.
+- [x] **Step 4: Run to verify pass** — `router_contract_test` PASS; rerun `serve_cli_test`. The test also records wall-clock latency of the cold-start request and the following hot request for the same model and prints both (`event=router_timing cold_ms=... hot_ms=...`) — recorded and retained per AGENTS.md per-request timing rules, never asserted against absolute values.
+- [x] **Step 5: Format, commit**
 
 ```sh
 git add src/cli/serve/router/router.cpp tests/cli/router_test.py CMakeLists.txt
@@ -615,7 +615,7 @@ git commit -m "feat(router): request routing, held loads, admission queue and ti
 
 WS: `IsWebSocketUpgrade(request)` paths resolve the model (query param), run the admission loop, then return an `HttpResponse` whose `websocket` callback calls `RelayWebSocket(target, front, &err)` wrapped in `WebSocketOpened/Closed` guards. Video POST: after proxying a `POST` under `IsVideoApiPath`, parse the buffered response JSON, and on 2xx `TrackVideoJob(id, model)`; the video job exempts its worker from eviction and idle unload until the job reaches a terminal state (front re-reads `GET <job path>` responses: terminal status field per `video_api.cpp` → `CompleteVideoJob`). Job read for a dead worker: reload that model first, then proxy (worker restores state from `--root`). Shutdown: SIGTERM → stop accepting, refuse new loads, wait up to 10 s for in-flight, `Stop()` workers (10 s grace), exit 0.
 
-- [ ] **Step 1: Write the failing contract additions**
+- [x] **Step 1: Write the failing contract additions**
 
 Extend `tests/cli/router_test.py` (fake worker gains a minimal WS echo endpoint):
 
@@ -634,10 +634,10 @@ Extend `tests/cli/router_test.py` (fake worker gains a minimal WS echo endpoint)
 #   exit code 0, no surviving workers
 ```
 
-- [ ] **Step 2: Verify failure** — WS case fails (dispatcher returns 404 for upgrades).
-- [ ] **Step 3: Implement** the wiring above in `router.cpp`.
-- [ ] **Step 4: Run to verify pass** — `ctest --test-dir build/cpu-test -R '^router_contract_test$'` PASS.
-- [ ] **Step 5: Format, commit**
+- [x] **Step 2: Verify failure** — WS case fails (dispatcher returns 404 for upgrades).
+- [x] **Step 3: Implement** the wiring above in `router.cpp`.
+- [x] **Step 4: Run to verify pass** — `ctest --test-dir build/cpu-test -R '^router_contract_test$'` PASS.
+- [x] **Step 5: Format, commit**
 
 ```sh
 git add src/cli/serve/router/router.cpp tests/cli/router_test.py
@@ -653,11 +653,11 @@ git commit -m "feat(router): websocket relay, video job tracking and lifecycle r
 - Create: `tests/cli/router_gpu_smoke.py`
 - Modify: `CMakeLists.txt` (register `router_gpu_smoke` with `LABELS "gpu"` so hosted CPU CI skips it, following how existing gpu-labeled tests are registered)
 
-- [ ] **Step 1: Write the docs**
+- [x] **Step 1: Write the docs**
 
 `docs/SERVER.md`: "Model router" section — subcommand synopsis with the spec's exact defaults, preset grammar with the spec's example, lifecycle table mirroring the spec's error-handling summary. `docs/CLI.md`: `gufo router` entry with every option and default. `README.md`: one feature bullet under the serving list. No CHANGELOG edit.
 
-- [ ] **Step 2: GPU smoke test (runs only under gpu-test)**
+- [x] **Step 2: GPU smoke test (runs only under gpu-test)**
 
 `tests/cli/router_gpu_smoke.py <gufo-binary>`: build a 2-section preset (tts + asr, small dirs resolved from the model paths `docs/SERVER.md` documents for those modalities; skip with a loud "SKIPPED: model dir missing" and exit 0 like existing model-dependent tests), start `gufo router --models-max 2`, one TTS request then one ASR request, assert both 200 and `/v1/models` loaded flags, idle-unload both with `--sleep-idle-seconds 2`, assert worker pids gone.
 
@@ -673,7 +673,7 @@ nix build .#checks.x86_64-linux.pr    # hosted contract suite
 
 Expected: all PASS. On a GPU dev box also: `nix develop -c cmake --preset gpu-test && nix develop -c ctest --preset gpu-full -R '^router_gpu_smoke$' --output-on-failure` — a missing-model SKIP is not a quality pass; report it as such.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```sh
 git add docs/SERVER.md docs/CLI.md README.md tests/cli/router_gpu_smoke.py CMakeLists.txt
