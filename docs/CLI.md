@@ -263,11 +263,12 @@ gufo router --models-preset models.ini --models-max 2
   spawn and readiness). Default: 600; `0` means unlimited.
 - `autoload` — preload preset models at startup in section order, up to
   `--models-max`; the rest still load on demand. Default: off.
--   Shared server options apply to the front: `host` / `port` (`-i` / `-p`,
+- Shared server options apply to the front: `host` / `port` (`-i` / `-p`,
   defaults `127.0.0.1:8080`, with `HOST` / `PORT` taking precedence over
-  `GUFO_HOST` / `GUFO_PORT`), `maxConnections` (default 16), `maxRequestBytes` (default
-  8388608), `apiKey` (default unset), `logLevel` (default `info`) and
-  `verbose` (`-v`). The router does not accept `--sessions`; each worker
+  `GUFO_HOST` / `GUFO_PORT`), `maxConnections` (`--max-connections`, default
+  16), `maxRequestBytes` (`--max-request-bytes`, default 8388608), `apiKey`
+  (`--api-key`, default unset), `logLevel` (`--log-level`, default `info`)
+  and `verbose` (`-v`). The router does not accept `--sessions`; each worker
   takes its own.
 
 `gufo router --help` also prints the preset grammar and every key accepted

@@ -446,13 +446,14 @@ if (BUILD_TESTING)
   set_tests_properties(router_contract_test PROPERTIES
     LABELS "cpu;server;router" TIMEOUT 120)
 
-  # Real-model smoke check: gpu label only, so the hosted `ctest -L cpu`
-  # contract run skips it and gpu-full executes it. Missing model dirs make
-  # the script print SKIPPED and exit 0.
+  # Real-model smoke check: gpu-only labels, so the hosted check-pr name
+  # filter skips it and gpu-fast excludes it while gpu-full executes it.
+  # Missing model dirs make the script print SKIPPED and exit 0.
   add_test(NAME router_gpu_smoke
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/router_gpu_smoke.py
       $<TARGET_FILE:gufo>)
-  set_tests_properties(router_gpu_smoke PROPERTIES LABELS "gpu" TIMEOUT 600)
+  set_tests_properties(router_gpu_smoke PROPERTIES
+    LABELS "gpu;hip;gfx1151;external-model;slow" TIMEOUT 600)
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)

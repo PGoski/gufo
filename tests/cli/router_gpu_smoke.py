@@ -1,6 +1,6 @@
 """GPU smoke check for `gufo router` with real TTS and ASR workers.
 
-Run through ctest as router_gpu_smoke (gpu label only) with the gufo binary
+Run through ctest as router_gpu_smoke (gpu;hip;gfx1151;external-model;slow)
 as argv[1]. Two preset sections (tts + asr) resolve from the model paths
 documented in docs/SERVER.md for those modalities; when either model
 directory is missing the check skips loudly with exit 0, like the other

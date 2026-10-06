@@ -375,7 +375,7 @@ the `HOST`, `PORT`, `GUFO_HOST` and `GUFO_PORT` environment fallbacks. The
 router injects `GUFO_HOST=127.0.0.1` and a reserved loopback `GUFO_PORT`
 into every child, so workers bind loopback and run keyless; the front
 enforces `--api-key` and never forwards a client `Authorization` header.
-`gufo router help` prints the preset grammar plus, per modality, the
+`gufo router --help` prints the preset grammar plus, per modality, the
 accepted keys generated from the same option registrations that render
 `gufo serve <modality> --help`.
 
@@ -456,7 +456,8 @@ job state.
 
 A worker spawns on the first request for its model; requests for the same
 model queue behind readiness, which is the worker's `/health` answering
-200 (503 means still loading). A worker becomes unloadable
+200 (anything else, including a refused connection, means still loading). A
+worker becomes unloadable
 `--sleep-idle-seconds` after its last activity, measured from both
 request start and request end, including full SSE streams and open
 WebSocket sessions; unload is SIGTERM followed by SIGKILL after a 10
