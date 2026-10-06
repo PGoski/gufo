@@ -887,15 +887,25 @@ private:
         }
         mutex.lock();
         if (exited) {
-          Logger::Warn("router", "event=worker_exit model=" + model_id +
-                                     " status=" + std::to_string(exit_status) +
-                                     " phase=load");
-          registry.MarkUnloaded(model_id);
-          workers.erase(model_id);
+          if (FindWorkerLocked(model_id) == worker) {
+            Logger::Warn("router",
+                         "event=worker_exit model=" + model_id + " status=" +
+                             std::to_string(exit_status) + " phase=load");
+            registry.MarkUnloaded(model_id);
+            workers.erase(model_id);
+          }
           redecide = true;
           continue;
         }
         if (healthy) {
+          // The load deadline may have expired (and a supervised stop erased
+          // this worker) while the probe ran unlocked. Arming ready without
+          // a worker behind it would strand the model loaded until the next
+          // request's own timeout, so re-decide instead.
+          if (FindWorkerLocked(model_id) != worker) {
+            redecide = true;
+            continue;
+          }
           registry.MarkReady(model_id);
           return port;
         }
@@ -1003,6 +1013,13 @@ int RunRouter(std::span<const char* const> args) {
                  &autoload);
   AddServerOptions(parser, &host, &port, nullptr, &max_connections,
                    &max_request_body_bytes, &api_key, &log_options);
+
+  // A bare `help` argument (e.g. `gufo router help`) prints the router help,
+  // matching sibling commands; ArgParser only understands --help/-h.
+  if (args.size() == 1 && args[0] == std::string_view("help")) {
+    PrintRouterHelp(parser);
+    return 0;
+  }
 
   std::string parse_error;
   if (!parser.Parse(args, &parse_error)) {
