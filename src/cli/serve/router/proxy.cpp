@@ -31,8 +31,12 @@ using Milliseconds = std::chrono::milliseconds;
 /// Receive timeout while streaming a body: bounds how long a cancelled
 /// request takes to notice between upstream chunks.
 constexpr Milliseconds kBodyPollInterval{50};
-/// Upper bound for the worker to produce its status line and headers.
+/// Bound for forwarding the request to the worker.
 constexpr Milliseconds kHeaderBudget{std::chrono::seconds(30)};
+/// Wait slice for the response head. `gufo serve` answers a non-streamed
+/// request only once it is complete (minutes for a long reply), so the head
+/// is awaited for as long as the client stays connected.
+constexpr Milliseconds kHeadPollInterval{std::chrono::seconds(1)};
 
 bool IEquals(std::string_view lhs, std::string_view rhs) {
   if (lhs.size() != rhs.size()) {
@@ -53,8 +57,19 @@ bool IsHopByHop(std::string_view name) {
 }
 
 bool IsDroppedRequestHeader(std::string_view name) {
+  // Expect: the front has already received the whole body. Forwarded, it
+  // makes the worker answer "100 Continue" before the real response.
   return IsHopByHop(name) || IEquals(name, "Authorization") ||
-         IEquals(name, "Host") || IEquals(name, "Content-Length");
+         IEquals(name, "Host") || IEquals(name, "Content-Length") ||
+         IEquals(name, "Expect") || IEquals(name, "TE") ||
+         IEquals(name, "Proxy-Connection");
+}
+
+/// An interim 1xx head (100 Continue, 103 Early Hints) that precedes the
+/// final one. 101 switches protocols and is final for this exchange.
+bool IsInterimHead(std::string_view data) {
+  return data.size() >= 12 && data.starts_with("HTTP/1.") && data[8] == ' ' &&
+         data[9] == '1' && data.substr(9, 3) != "101";
 }
 
 std::string Trim(std::string value) {
@@ -196,28 +211,32 @@ struct UpstreamHead {
   std::string remainder;  // body bytes received together with the head
 };
 
-/// Read status line + headers. Returns false on EOF before headers, a
-/// header-phase timeout, or a malformed head.
-bool ReadHead(int fd, UpstreamHead* head, std::string* error) {
+/// Read status line + headers. Returns false on EOF before headers, a client
+/// that went away while waiting, or a malformed head. There is no deadline:
+/// the worker's own request limits end a stuck request, and its exit closes
+/// the connection.
+bool ReadHead(int fd, const gufo::server::HttpRequest& front,
+              UpstreamHead* head, std::string* error) {
   std::string data;
   std::size_t header_end = std::string::npos;
-  const auto start = std::chrono::steady_clock::now();
   char buffer[4096];
   while (header_end == std::string::npos) {
     bool timed_out = false;
-    const auto elapsed = std::chrono::duration_cast<Milliseconds>(
-        std::chrono::steady_clock::now() - start);
-    const auto remaining =
-        kHeaderBudget > elapsed ? kHeaderBudget - elapsed : Milliseconds(1);
     const auto count =
-        Receive(fd, remaining, buffer, sizeof(buffer), &timed_out);
+        Receive(fd, kHeadPollInterval, buffer, sizeof(buffer), &timed_out);
     if (count == 0) {
       *error = "connection closed before headers";
       return false;
     }
+    if (count < 0 && timed_out) {
+      if (front.is_cancelled && front.is_cancelled()) {
+        *error = "client disconnected while waiting for the worker";
+        return false;
+      }
+      continue;
+    }
     if (count < 0) {
-      *error =
-          timed_out ? "timed out waiting for headers" : std::strerror(errno);
+      *error = std::strerror(errno);
       return false;
     }
     data.append(buffer, static_cast<std::size_t>(count));
@@ -226,6 +245,12 @@ bool ReadHead(int fd, UpstreamHead* head, std::string* error) {
       return false;
     }
     header_end = data.find("\r\n\r\n");
+    // Relayed as final, an interim head would hand the client the real
+    // response as its body.
+    while (header_end != std::string::npos && IsInterimHead(data)) {
+      data.erase(0, header_end + 4);
+      header_end = data.find("\r\n\r\n");
+    }
   }
   std::vector<std::string> lines;
   std::size_t pos = 0;
@@ -456,7 +481,7 @@ gufo::server::HttpResponse ProxyToWorker(
     return UpstreamUnavailable("failed to forward request");
   }
   UpstreamHead head;
-  if (!ReadHead(fd, &head, &error)) {
+  if (!ReadHead(fd, request, &head, &error)) {
     return UpstreamUnavailable(error);
   }
 
